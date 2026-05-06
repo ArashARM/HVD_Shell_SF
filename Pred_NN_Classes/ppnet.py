@@ -74,7 +74,9 @@ class PPNet(nn.Module):
 
         # This model is used as an optimization parameterization for a single problem instance, so no external context conditioning is required.
         self.global_latent = nn.Parameter(torch.zeros(hidden))
+        # Each seed gets a learnable identity embedding, which can help the network learn seed-specific behavior.
         self.seed_identity = SeedIdentityEmbedding(self.n_seeds, self.seed_id_dim)
+        # The seed refiner takes the global latent, seed UVs, and optional seed ID features to produce refined seed positions and a hidden representation for each seed.
         self.seed_refiner = SeedRefiner(
             hidden=hidden,
             seed_id_dim=self.seed_id_dim,

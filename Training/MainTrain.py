@@ -42,6 +42,7 @@ except ImportError:
 @dataclass
 class TrainingConfig:
     seed_number: int = 15
+    training_face_index: int = 0
     LoadingCasee: str = "Unspecified loading case"
     use_Metric_anisotropy: bool = True
     fixed_height: float | None = None
@@ -194,6 +195,12 @@ class TrainingConfig:
     TM_laps_Thr: float = 0.45
 
     def __post_init__(self):
+        self.training_face_index = int(self.training_face_index)
+        if self.training_face_index < 0:
+            raise ValueError(
+                f"training_face_index must be >= 0, got {self.training_face_index}"
+            )
+
         if self.tau__anneal_final is not None:
             self.tau_anneal_final = self.tau__anneal_final
 
@@ -830,11 +837,7 @@ class NN_Trainer:
         return f"{minutes:d} min {secs:02d} sec"
 
     def _timelapse_geometry_summary(self, face_tensors) -> str:
-        if self.shell_problem is not None and getattr(self.shell_problem, "mesh", None) is not None:
-            fem_mesh = self.shell_problem.mesh
-            fem_elems = int(fem_mesh["nelx"]) * int(fem_mesh["nely"]) * int(fem_mesh["nelz"])
-        else:
-            fem_elems = 0
+
 
         surface_pts = int(sum(int(ft["points_xyz"].shape[0]) for ft in face_tensors))
 
@@ -859,9 +862,7 @@ class NN_Trainer:
         bbox_text = " x ".join(f"{dim:.4g}" for dim in bbox_dims)
         return (
             f"BBox: {bbox_text}, "
-            f"F={load_value:.6g}, "
-            f"SurfacePts={surface_pts}, "
-            f"FEM elements={fem_elems}"
+            f"SurfacePts={surface_pts} "
         )
 
     def _timelapse_optimized_parameter_summary(self) -> str:
@@ -1346,81 +1347,71 @@ class NN_Trainer:
 
         return decoder, ppnet
 
-    def _build_face_models(self, face_tensors, device):
-        cfg = self.cfg
-        decoders = []
-        ppnets = []
+    def _build_face_model(self, face_tensor, device):
+        return self._build_single_face_models(
+            device=device,
+            seed_number=self.cfg.seed_number,
+            boundary_idx_ring1=face_tensor["boundary_idx_ring1"],
+            u_periodic=face_tensor.get("u_periodic", False),
+            v_periodic=face_tensor.get("v_periodic", False),
+        )
 
-        for ft in face_tensors:
-            decoder, ppnet = self._build_single_face_models(
-                device=device,
-                seed_number=cfg.seed_number,
-                boundary_idx_ring1=ft["boundary_idx_ring1"],
-                u_periodic=ft.get("u_periodic", False),
-                v_periodic=ft.get("v_periodic", False),
-            )
-            decoders.append(decoder)
-            ppnets.append(ppnet)
-
-        return decoders, ppnets
-
-    def _build_optimizer(self, ppnets, decoders):
+    def _build_optimizer(self, ppnet, decoder):
         cfg = self.cfg
         param_groups = []
 
-        for ppnet in ppnets:
-            seed_refine_params = list(ppnet.seed_refine.parameters())
-            if getattr(ppnet, "seed_id_embed", None) is not None:
-                seed_refine_params.extend(ppnet.seed_id_embed.parameters())
+        seed_refine_params = list(ppnet.seed_refine.parameters())
+        if getattr(ppnet, "seed_id_embed", None) is not None:
+            seed_refine_params.extend(ppnet.seed_id_embed.parameters())
 
-            param_groups.extend([
-                {"params": seed_refine_params, "lr": cfg.lr_seed_refine},
-                {"params": ppnet.delta_head.parameters(), "lr": cfg.lr_delta_head},
-                {"params": [ppnet.global_latent], "lr": cfg.lr_mlp},
-            ])
+        param_groups.extend([
+            {"params": seed_refine_params, "lr": cfg.lr_seed_refine},
+            {"params": ppnet.delta_head.parameters(), "lr": cfg.lr_delta_head},
+            {"params": [ppnet.global_latent], "lr": cfg.lr_mlp},
+        ])
 
-            w_head = getattr(ppnet, "w_head", None)
-            if w_head is not None:
-                param_groups.append({"params": w_head.parameters(), "lr": cfg.lr_w_head})
+        w_head = getattr(ppnet, "w_head", None)
+        if w_head is not None:
+            param_groups.append({"params": w_head.parameters(), "lr": cfg.lr_w_head})
 
-            h_head = getattr(ppnet, "h_head", None)
-            if (self.cfg.fixed_height is None) and h_head is not None:
-                param_groups.append({"params": h_head.parameters(), "lr": cfg.lr_h_head})
+        h_head = getattr(ppnet, "h_head", None)
+        if (self.cfg.fixed_height is None) and h_head is not None:
+            param_groups.append({"params": h_head.parameters(), "lr": cfg.lr_h_head})
 
-            if cfg.use_Metric_anisotropy:
-                theta_head = getattr(ppnet, "theta_head", None)
-                if theta_head is not None:
-                    param_groups.append({"params": theta_head.parameters(), "lr": cfg.lr_mlp})
-                a_head = getattr(ppnet, "a_head", None)
-                if a_head is not None:
-                    param_groups.append({"params": a_head.parameters(), "lr": cfg.lr_mlp})
+        if cfg.use_Metric_anisotropy:
+            theta_head = getattr(ppnet, "theta_head", None)
+            if theta_head is not None:
+                param_groups.append({"params": theta_head.parameters(), "lr": cfg.lr_mlp})
+            a_head = getattr(ppnet, "a_head", None)
+            if a_head is not None:
+                param_groups.append({"params": a_head.parameters(), "lr": cfg.lr_mlp})
 
-            if cfg.predict_boundary_params:
-                boundary_width_head = getattr(ppnet, "boundary_width_head", None)
-                if boundary_width_head is not None:
-                    param_groups.append({
-                        "params": boundary_width_head.parameters(),
-                        "lr": cfg.lr_boundary_heads,
-                    })
-                boundary_alpha_head = getattr(ppnet, "boundary_alpha_head", None)
-                if boundary_alpha_head is not None:
-                    param_groups.append({
-                        "params": boundary_alpha_head.parameters(),
-                        "lr": cfg.lr_boundary_heads,
-                    })
-                boundary_beta_head = getattr(ppnet, "boundary_beta_head", None)
-                if boundary_beta_head is not None:
-                    param_groups.append({
-                        "params": boundary_beta_head.parameters(),
-                        "lr": cfg.lr_boundary_heads,
-                    })
-
-            tau_head = getattr(ppnet, "tau_head", None)
-            if cfg.predict_tau and tau_head is not None:
+        if cfg.predict_boundary_params:
+            boundary_width_head = getattr(ppnet, "boundary_width_head", None)
+            if boundary_width_head is not None:
                 param_groups.append({
-                    "params": tau_head.parameters(),
-                    "lr": cfg.lr_mlp,
+                    "params": boundary_width_head.parameters(),
+                    "lr": cfg.lr_boundary_heads,
                 })
+            boundary_alpha_head = getattr(ppnet, "boundary_alpha_head", None)
+            if boundary_alpha_head is not None:
+                param_groups.append({
+                    "params": boundary_alpha_head.parameters(),
+                    "lr": cfg.lr_boundary_heads,
+                })
+            boundary_beta_head = getattr(ppnet, "boundary_beta_head", None)
+            if boundary_beta_head is not None:
+                param_groups.append({
+                    "params": boundary_beta_head.parameters(),
+                    "lr": cfg.lr_boundary_heads,
+                })
+
+        tau_head = getattr(ppnet, "tau_head", None)
+        if cfg.predict_tau and tau_head is not None:
+            param_groups.append({
+                "params": tau_head.parameters(),
+                "lr": cfg.lr_mlp,
+            })
 
         return torch.optim.Adam(param_groups)
 
@@ -1475,36 +1466,22 @@ class NN_Trainer:
         return out
     
     
-    def _init_face_seeds(self, face_tensors):
+    def _init_face_seed(self, face_tensor):
         cfg = self.cfg
-        uv_init_list = []
+        boundary = self._true_open_boundary_idx(face_tensor)
+        seed_idx = self.generator.fps_3d(
+            face_tensor["points_xyz"],
+            cfg.seed_number,
+            exclude_idx=boundary,
+        )
+        return face_tensor["uv"][seed_idx].clone()
 
-        for ft in face_tensors:
-            boundary = self._true_open_boundary_idx(ft)
-            seed_idx = self.generator.fps_3d(
-                ft["points_xyz"],
-                cfg.seed_number,
-                exclude_idx=boundary,
-            )
-            uv_init_list.append(ft["uv"][seed_idx].clone())
-
-        return uv_init_list
-
-    def _seed_points_xyz_all_faces(self, seeds_list, face_tensors):
-        xyz_parts = []
-        for seeds, ft in zip(seeds_list, face_tensors):
-            xyz_i = self.generator.seeds_uv_to_xyz_nearest(
-                seeds,
-                ft["uv"],
-                ft["points_xyz"],
-            )
-            xyz_parts.append(xyz_i)
-
-        if len(xyz_parts) == 0:
-            return None
-
-        import numpy as np
-        return np.concatenate(xyz_parts, axis=0)
+    def _seed_points_xyz(self, seeds, face_tensor):
+        return self.generator.seeds_uv_to_xyz_nearest(
+            seeds,
+            face_tensor["uv"],
+            face_tensor["points_xyz"],
+        )
 
     def _finite_or_default(self, x: torch.Tensor | float | int, default: float = float("nan")) -> float:
         if self._scalar_tensor_is_finite(x):
@@ -1627,6 +1604,31 @@ class NN_Trainer:
                     f"face_tensors[{i}]['face_areas'] length must match number of faces "
                     f"({face_areas.shape[0]} != {faces_ijk.shape[0]})"
                 )
+
+    def _select_single_training_face(self, face_tensors):
+        if not isinstance(face_tensors, (list, tuple)) or len(face_tensors) == 0:
+            raise ValueError("face_tensors must be a non-empty list.")
+
+        face_index = int(getattr(self.cfg, "training_face_index", 0))
+        if face_index < 0 or face_index >= len(face_tensors):
+            raise IndexError(
+                f"training_face_index={face_index} is out of range for "
+                f"{len(face_tensors)} face tensor(s)"
+            )
+
+        selected = dict(face_tensors[face_index])
+        selected["global_vertex_idx"] = torch.arange(
+            selected["uv"].shape[0],
+            dtype=torch.long,
+            device=selected["uv"].device,
+        )
+
+        if len(face_tensors) > 1:
+            tqdm.write(
+                f"Using only face_tensors[{face_index}] for single-face training "
+                f"(received {len(face_tensors)} faces)."
+            )
+        return [selected]
 
     def _safe_weighted_mean(self, values, weights, dtype, device, eps):
         if len(values) == 0:
@@ -3398,48 +3400,46 @@ class NN_Trainer:
         cfg = self.cfg
         train_start_time = time.perf_counter()
 
-        # validate the input shape tensors before training
+        # Always train one face. If multiple faces are provided, use cfg.training_face_index.
+        face_tensors = self._select_single_training_face(face_tensors)
+        face_tensor = face_tensors[0]
+
+        # validate the selected face tensor before training
         self._validate_face_tensors(face_tensors)
 
         # Assign device and data type used during training process
-        ref_uv = face_tensors[0]["uv"]
+        ref_uv = face_tensor["uv"]
         device = ref_uv.device
         dtype = ref_uv.dtype
         mid_step = cfg.num_steps // 2
 
-        # Total number of points used for training
-        all_global_idx = torch.cat([ft["global_vertex_idx"] for ft in face_tensors], dim=0)
-        vertices_number = int(all_global_idx.max().item()) + 1
+        # Total number of points used for training on the selected face
+        gidx = face_tensor["global_vertex_idx"]
+        vertices_number = int(gidx.max().item()) + 1
         # ------------------------------------------------------------
         # Build global vertex areas
         A_v = torch.zeros((vertices_number,), dtype=dtype, device=device)
-        local_vertex_areas = []
-        local_face_weights = []
-
-
-        # in this for loop, we compute the lumped vertex areas for each face and accumulate them into a global vertex area tensor A_v.
-        for ft in face_tensors:
-            gidx = ft["global_vertex_idx"]
-            A_local = self.generator.vertex_area_lumped(
-                ft["uv"].shape[0],
-                ft["faces_ijk"],
-                ft["face_areas"],
-            ).to(device=device, dtype=dtype)
-
-            local_vertex_areas.append(A_local)
-            local_face_weights.append(A_local.sum().clamp_min(cfg.eps))
-            A_v[gidx] += A_local
+        A_local = self.generator.vertex_area_lumped(
+            face_tensor["uv"].shape[0],
+            face_tensor["faces_ijk"],
+            face_tensor["face_areas"],
+        ).to(device=device, dtype=dtype)
+        face_weight = A_local.sum().clamp_min(cfg.eps)
+        A_v[gidx] += A_local
 
         # ------------------------------------------------------------
         # Build models / optimizer / scheduler
         # ------------------------------------------------------------
-        decoders, ppnets = self._build_face_models(face_tensors=face_tensors, device=device)
-        # Build initial seeds from face tensors for all faces, which will be optimized during training. Output shape is (n_faces, n_seeds_per_face, 2).
-        uv_init_list = self._init_face_seeds(face_tensors)
-        uv_anchor_list = [uv_i.clone() for uv_i in uv_init_list]
+        decoder, ppnet = self._build_face_model(face_tensor=face_tensor, device=device)
+        decoders = [decoder]
+        ppnets = [ppnet]
+        # Build initial seeds from the selected face tensor, which will be optimized during training.
+        uv_init = self._init_face_seed(face_tensor)
+        uv_anchor = uv_init.clone()
+        uv_init_list = [uv_init]
 
         # Build the optimizer for all ppnet parameters. It includes the learning parameters,  optimizer type and learning rate are determined by the configuration (cfg).
-        opt = self._build_optimizer(ppnets, decoders)
+        opt = self._build_optimizer(ppnet, decoder)
         # getatt(A,"S",None) is try to reach attribute "S" in object A, if it doesn't exist, it will return None instead of raising an error. 
         # here we are trying to get the "scheduler_milestones" attribute from the configuration (cfg). I
         #these milestones are specific training steps at which the learning rate will be adjusted according to a predefined schedule. 
@@ -3489,6 +3489,18 @@ class NN_Trainer:
             # The output directory for the frames is "timelapse_frames", 
             # the video will be saved with the name "{case_name}_timelapse.avi". 
             # The frames per second (fps) for the video is set to 8.
+            if self.shell_problem is not None and getattr(self.shell_problem, "mesh", None) is not None:
+                fem_mesh = self.shell_problem.mesh
+                fem_elems = int(fem_mesh["nelx"]) * int(fem_mesh["nely"]) * int(fem_mesh["nelz"])
+            else:
+                fem_elems = 0
+            
+
+            load_value = (
+            float(getattr(self.shell_problem, "Load_magnitude", 0.0))
+            if self.shell_problem is not None
+            else 0.0
+        )
             geometry_summary = self._timelapse_geometry_summary(face_tensors)
             recorder = TimelapseRecorder(
                 out_dir=frame_out_dir,
@@ -3496,7 +3508,7 @@ class NN_Trainer:
                 fps=8,
                 header_title=(
                     f"{shape_path.name} ({geometry_summary}) | "
-                    f"Loading case: {cfg.LoadingCasee} | "
+                    f"BC: {cfg.LoadingCasee} (F = {load_value:.3f} , FEM elements: {fem_elems}) | "
                     f"Target volfrac: {cfg.target_volfrac:.3f}"
                 ),
                 header_subtitle=self._timelapse_optimized_parameter_summary(),
@@ -3584,12 +3596,10 @@ class NN_Trainer:
             dynamic_ncols=True,
         ) as pbar:
             for step in pbar:
-                
-                
+    
                 # if cfg.allow_seed_outside_domain is true and the warmup period is over, allow seeds to be placed outside the domain
                 allow_seed_outside_domain_step = self.allow_seed_outside_domain_for_step(step)
-                for ppnet in ppnets:
-                    ppnet.allow_seed_outside_domain = allow_seed_outside_domain_step
+                ppnet.allow_seed_outside_domain = allow_seed_outside_domain_step
                 # if cfg.predict_tau is none , always use cfg.tau as the tau value.
                 # if cfg.predict_tau is true,  it returns  cfg.tau_predic_start
                 # if Cfg.predict_tau is false, it returns annealed value.
@@ -3658,16 +3668,12 @@ class NN_Trainer:
                     and (anchor_update_allowed or not cfg.guard_seed_anchor_updates)
                 )
                 seed_offset_scale_step = self.seed_offset_scale_for_step(step)
-                uv_anchor_next_list = []
+                uv_anchor_next = None
 
-                for ft, decoder, ppnet, uv_anchor_i, A_local, face_weight_i in zip(
-                    face_tensors,
-                    decoders,
-                    ppnets,
-                    uv_anchor_list,
-                    local_vertex_areas,
-                    local_face_weights,
-                ):
+                ft = face_tensor
+                uv_anchor_i = uv_anchor
+                face_weight_i = face_weight
+                if True:
                     pred_i = ppnet(uv_anchor_i, offset_scale=seed_offset_scale_step)
 
                     seeds_raw_i = pred_i["seeds_raw"]
@@ -3852,7 +3858,7 @@ class NN_Trainer:
                         )
                     else:
                         uv_anchor_next_i = uv_anchor_i.detach().clone()
-                    uv_anchor_next_list.append(uv_anchor_next_i)
+                    uv_anchor_next = uv_anchor_next_i
 
                     pred_list.append({
                         "face_id": ft["face_id"],
@@ -3946,27 +3952,18 @@ class NN_Trainer:
                         strut_edge_terms.append(loss_strut_edge_i)
                         strut_void_terms.append(loss_strut_void_i)
 
-                uv_anchor_list = uv_anchor_next_list
+                uv_anchor = uv_anchor_next
 
                 # ----------------------------------------------------
-                # Aggregate face outputs
+                # Selected-face outputs
                 # ----------------------------------------------------
-                if active_face_count > 0:
-                    participating_count_mean = participating_count_total / active_face_count
-                    participating_frac_mean = participating_frac_sum / active_face_count
-                    inactive_count_mean = inactive_count_total / active_face_count
-                    inactive_frac_mean = inactive_frac_sum / active_face_count
-                    active_weight_min_global = min(active_weight_min_list)
-                    active_weight_mean_global = active_weight_mean_sum / active_face_count
-                    active_weight_max_global = max(active_weight_max_list)
-                else:
-                    participating_count_mean = 0.0
-                    participating_frac_mean = 0.0
-                    inactive_count_mean = 0.0
-                    inactive_frac_mean = 0.0
-                    active_weight_min_global = 0.0
-                    active_weight_mean_global = 0.0
-                    active_weight_max_global = 0.0
+                participating_count_mean = participating_count_total
+                participating_frac_mean = participating_frac_sum
+                inactive_count_mean = inactive_count_total
+                inactive_frac_mean = inactive_frac_sum
+                active_weight_min_global = active_weight_min_list[0] if active_weight_min_list else 0.0
+                active_weight_mean_global = active_weight_mean_sum
+                active_weight_max_global = active_weight_max_list[0] if active_weight_max_list else 0.0
 
                 rho = rho_acc / rho_wgt.clamp_min(cfg.eps)
                 rho_boundary = rho_b_acc / rho_b_wgt.clamp_min(cfg.eps)
@@ -3979,24 +3976,24 @@ class NN_Trainer:
 
                 zero = torch.zeros((), dtype=dtype, device=device)
 
-                loss_rep = self._safe_weighted_mean(rep_terms, face_weights_this_step, dtype, device, cfg.eps) if compute_rep_loss else zero
-                loss_bnd = self._safe_weighted_mean(bnd_terms, face_weights_this_step, dtype, device, cfg.eps) if compute_bnd_loss else zero
-                loss_strut = self._safe_weighted_mean(strut_terms, face_weights_this_step, dtype, device, cfg.eps) if compute_strut_loss else zero
-                loss_strut_edge = self._safe_weighted_mean(strut_edge_terms, face_weights_this_step, dtype, device, cfg.eps) if compute_strut_loss else zero
-                loss_strut_void = self._safe_weighted_mean(strut_void_terms, face_weights_this_step, dtype, device, cfg.eps) if compute_strut_loss else zero
-                loss_seed_active = self._safe_weighted_mean(seed_active_terms, face_weights_this_step, dtype, device, cfg.eps) if compute_seed_active_loss else zero
+                loss_rep = rep_terms[0] if compute_rep_loss and rep_terms else zero
+                loss_bnd = bnd_terms[0] if compute_bnd_loss and bnd_terms else zero
+                loss_strut = strut_terms[0] if compute_strut_loss and strut_terms else zero
+                loss_strut_edge = strut_edge_terms[0] if compute_strut_loss and strut_edge_terms else zero
+                loss_strut_void = strut_void_terms[0] if compute_strut_loss and strut_void_terms else zero
+                loss_seed_active = seed_active_terms[0] if compute_seed_active_loss and seed_active_terms else zero
 
-                w_geo_mean = self._safe_weighted_mean(w_geo_terms, face_weights_this_step, dtype, device, cfg.eps)
-                h_mean = self._safe_weighted_mean(h_terms, face_weights_this_step, dtype, device, cfg.eps)
+                w_geo_mean = w_geo_terms[0] if w_geo_terms else zero
+                h_mean = h_terms[0] if h_terms else zero
 
-                boundary_width_mean = self._safe_weighted_mean(boundary_width_terms, face_weights_this_step, dtype, device, cfg.eps)
-                boundary_alpha_mean = self._safe_weighted_mean(boundary_alpha_terms, face_weights_this_step, dtype, device, cfg.eps)
-                boundary_beta_mean = self._safe_weighted_mean(boundary_beta_terms, face_weights_this_step, dtype, device, cfg.eps)
+                boundary_width_mean = boundary_width_terms[0] if boundary_width_terms else zero
+                boundary_alpha_mean = boundary_alpha_terms[0] if boundary_alpha_terms else zero
+                boundary_beta_mean = boundary_beta_terms[0] if boundary_beta_terms else zero
 
-                theta_mean = self._safe_weighted_mean(theta_mean_terms, face_weights_this_step, dtype, device, cfg.eps)
-                a_metric_mean = self._safe_weighted_mean(a_metric_terms, face_weights_this_step, dtype, device, cfg.eps)
+                theta_mean = theta_mean_terms[0] if theta_mean_terms else zero
+                a_metric_mean = a_metric_terms[0] if a_metric_terms else zero
 
-                loss_width_active = self._safe_weighted_mean(width_active_terms, face_weights_this_step, dtype, device, cfg.eps) if compute_width_active_loss else zero
+                loss_width_active = width_active_terms[0] if compute_width_active_loss and width_active_terms else zero
 
                 # ----------------------------------------------------
                 # Volume loss
@@ -4158,7 +4155,6 @@ class NN_Trainer:
                     elif not cfg.skip_bad_fem_steps:
                         L_total = L_total + cfg.lam_fem * loss_fem
 
-                L_total = L_total / len(face_tensors)
                 total_is_finite = self._scalar_tensor_is_finite(L_total)
 
                 # ----------------------------------------------------
@@ -4189,9 +4185,7 @@ class NN_Trainer:
 
                         grad_clip_norm = getattr(cfg, "grad_clip_norm", None)
                         if grad_clip_norm is not None and grad_clip_norm > 0:
-                            params = []
-                            for ppnet in ppnets:
-                                params.extend([p for p in ppnet.parameters() if p.requires_grad])
+                            params = [p for p in ppnet.parameters() if p.requires_grad]
                             if params:
                                 torch.nn.utils.clip_grad_norm_(params, max_norm=grad_clip_norm)
 
@@ -4209,11 +4203,10 @@ class NN_Trainer:
                                     p.grad = None
                         else:
                             if use_hard_refine_step:
-                                for ppnet in ppnets:
-                                    tau_head = getattr(ppnet, "tau_head", None)
-                                    if cfg.freeze_tau_head_during_hard_refine and tau_head is not None:
-                                        for p in tau_head.parameters():
-                                            p.grad = None
+                                tau_head = getattr(ppnet, "tau_head", None)
+                                if cfg.freeze_tau_head_during_hard_refine and tau_head is not None:
+                                    for p in tau_head.parameters():
+                                        p.grad = None
                             opt.step()
 
                             bad_param_info = self._nonfinite_param_info(ppnets)
@@ -4264,11 +4257,11 @@ class NN_Trainer:
 
                     if step == 0:
                         initial_shape_density = rho.detach().clone()
-                        seed_points_init = self._seed_points_xyz_all_faces(seeds_list, face_tensors)
+                        seed_points_init = self._seed_points_xyz(seeds_i, face_tensor)
 
                     if step == mid_step:
                         mid_shape_density = rho.detach().clone()
-                        seed_points_mid = self._seed_points_xyz_all_faces(seeds_list, face_tensors)
+                        seed_points_mid = self._seed_points_xyz(seeds_i, face_tensor)
 
                     if best_candidate_is_valid and score < (best_score - cfg.min_delta):
                         best_score = score
@@ -4320,11 +4313,10 @@ class NN_Trainer:
 
                     g_mean = 0.0
                     g_count = 0
-                    for ppnet in ppnets:
-                        for p in ppnet.parameters():
-                            if p.grad is not None:
-                                g_mean += float(p.grad.detach().abs().mean().item())
-                                g_count += 1
+                    for p in ppnet.parameters():
+                        if p.grad is not None:
+                            g_mean += float(p.grad.detach().abs().mean().item())
+                            g_count += 1
                     g_mean = g_mean / max(g_count, 1)
 
                     row = {
@@ -4574,31 +4566,26 @@ class NN_Trainer:
             hard_rho_wgt = torch.zeros((vertices_number,), dtype=dtype, device=device)
             hard_fiber_acc = torch.zeros((vertices_number, 3), dtype=dtype, device=device)
             hard_fiber_wgt = torch.zeros((vertices_number,), dtype=dtype, device=device)
-            pred_by_face_id = {p["face_id"]: p for p in best_pred} if best_pred else {}
-
-            for ft, decoder, A_local in zip(face_tensors, decoders, local_vertex_areas):
-                pred_i = pred_by_face_id.get(ft["face_id"], None)
-                if pred_i is None:
-                    continue
-
-                local_face_id = torch.zeros(ft["uv"].shape[0], dtype=torch.long, device=device)
+            pred_i = best_pred[0] if best_pred else None
+            if pred_i is not None:
+                local_face_id = torch.zeros(face_tensor["uv"].shape[0], dtype=torch.long, device=device)
                 boundary_uv_i = None
                 boundary_face_id_i = None
-                true_bidx_i = self._true_open_boundary_idx(ft)
+                true_bidx_i = self._true_open_boundary_idx(face_tensor)
                 if true_bidx_i.numel() > 0:
-                    boundary_uv_i = ft["uv"][true_bidx_i]
+                    boundary_uv_i = face_tensor["uv"][true_bidx_i]
                     boundary_face_id_i = torch.zeros(
                         boundary_uv_i.shape[0],
                         dtype=torch.long,
                         device=device,
                     )
-                seed_domain_mask_i = self._seed_domain_mask_for_face(ft)
+                seed_domain_mask_i = self._seed_domain_mask_for_face(face_tensor)
 
                 tau_i = self._fallback_tau_value() if pred_i.get("tau") is None else pred_i["tau"]
                 hard_out_i = decoder.evaluate_at_uv(
-                    points_uv=ft["uv"],
-                    Xu=ft["Xu"],
-                    Xv=ft["Xv"],
+                    points_uv=face_tensor["uv"],
+                    Xu=face_tensor["Xu"],
+                    Xv=face_tensor["Xv"],
                     tau=tau_i,
                     seeds_raw=pred_i["seeds_raw"],
                     w_raw=pred_i["w_raw"],
@@ -4617,7 +4604,6 @@ class NN_Trainer:
                     seed_domain_temp=cfg.seed_domain_temp,
                 )
 
-                gidx = ft["global_vertex_idx"]
                 w_local = A_local.clamp_min(cfg.eps)
                 hard_rho_acc[gidx] += hard_out_i["rho"] * w_local
                 hard_rho_wgt[gidx] += w_local
@@ -4632,7 +4618,7 @@ class NN_Trainer:
                 final_shape_fiber_direction / final_fiber_norm.clamp_min(cfg.eps),
                 torch.zeros_like(final_shape_fiber_direction),
             )
-            seed_points_final = self._seed_points_xyz_all_faces(best_seeds, face_tensors)
+            seed_points_final = self._seed_points_xyz(best_seeds[0], face_tensor)
 
             if mid_shape_density is None:
                 mid_shape_density = final_shape_density.clone()
@@ -4662,7 +4648,7 @@ class NN_Trainer:
 
         if cfg.MakeTimelaps:
             try:
-                total_seed_slots = int(cfg.seed_number) * max(len(best_pred) if best_pred else len(face_tensors), 1)
+                total_seed_slots = int(cfg.seed_number)
                 active_seed_count = int(round(float(best_active_count or 0.0)))
                 best_vol_total = (
                     float(best_row["vol_frac"])
@@ -4797,7 +4783,7 @@ class NN_Trainer:
             "seed_points_final": seed_points_final,
             "A_v": A_v,
             "uv_init_list": uv_init_list,
-            "uv_anchor_list": uv_anchor_list,
+            "uv_anchor_list": [uv_anchor],
             "face_tensors": face_tensors,
             "fem_debug_history": self.fem_debug_history,
             "last_fem_debug": self.last_fem_debug,

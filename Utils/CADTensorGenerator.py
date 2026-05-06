@@ -51,6 +51,7 @@ class CADTensorGenerator:
         gmsh_algorithm: int = 6,
         seed_domain_mask_res: int = 128,
         seed_domain_trim_tol: float = 1e-7,
+        selected_face_index: int = 0,
     ):
         self.deflection = float(deflection)
         self.angle = float(angle)
@@ -64,6 +65,11 @@ class CADTensorGenerator:
         self.gmsh_algorithm = int(gmsh_algorithm)
         self.seed_domain_mask_res = int(seed_domain_mask_res)
         self.seed_domain_trim_tol = float(seed_domain_trim_tol)
+        self.selected_face_index = int(selected_face_index)
+        if self.selected_face_index < 0:
+            raise ValueError(
+                f"selected_face_index must be >= 0, got {self.selected_face_index}"
+            )
 
     # =========================================================================
     # 1) Load + face helpers
@@ -731,6 +737,9 @@ class CADTensorGenerator:
         face_rows = []
 
         for face_id, face in enumerate(self.iter_faces(shape)):
+            if int(face_id) != int(self.selected_face_index):
+                continue
+
             try:
                 samp = self.sample_surface_points_uniform_weighted_pool(
                     face=face,
@@ -820,6 +829,10 @@ class CADTensorGenerator:
  
         mesh_df = pd.DataFrame(mesh_rows)
         faces_df = pd.DataFrame(face_rows)
+        if mesh_df.empty:
+            raise ValueError(
+                f"No mesh rows were produced for selected_face_index={self.selected_face_index}."
+            )
         return mesh_df, faces_df
 
     # =========================================================================
@@ -847,6 +860,9 @@ class CADTensorGenerator:
         face_lvid_to_gvid = {}
 
         for face_id, face in enumerate(self.iter_faces(shape)):
+            if int(face_id) != int(self.selected_face_index):
+                continue
+
             (umin, umax, vmin, vmax), surf = self.face_uv_bounds_and_surface(face)
             surface_u_periodic, surface_v_periodic, u_period, v_period = self.face_uv_periodicity(face)
 
@@ -1011,6 +1027,10 @@ class CADTensorGenerator:
 
         mesh_df = pd.DataFrame(mesh_rows)
         faces_df = pd.DataFrame(face_rows)
+        if mesh_df.empty:
+            raise ValueError(
+                f"No mesh rows were produced for selected_face_index={self.selected_face_index}."
+            )
         return mesh_df, faces_df    # =========================================================================
     @staticmethod
     def _empty_long(device):
@@ -1505,6 +1525,15 @@ class CADTensorGenerator:
                 "v_period": face_dict["v_period"],
             }
 
+        if len(face_tensors) == 1:
+            selected_face_tensor = face_tensors[0]
+            original_fid = int(selected_face_tensor["face_id"])
+            face_tensors_by_id.setdefault(0, selected_face_tensor)
+            if original_fid in BBX:
+                BBX.setdefault(0, BBX[original_fid])
+            if original_fid in face_periodicity:
+                face_periodicity.setdefault(0, face_periodicity[original_fid])
+
         print("MinVolFrac:", min_vol_frac)
         print(
             "Mesh edge length:",
@@ -1547,17 +1576,24 @@ class CADTensorGenerator:
         fps_pool_factor: int = 4,
         use_fps: bool = True,
         triangulation_max_edge_rel: float = 0.35,
+        selected_face_index: int | None = None,
     ):
-        mesh_df, faces_df = self.export_face_mesh_metric_points_triangulated(
-            shape_path=shape_path,
-            M_per_face=M_per_face,
-            pool_size_factor=pool_size_factor,
-            fps_pool_factor=fps_pool_factor,
-            use_fps=use_fps,
-            triangulation_max_edge_rel=triangulation_max_edge_rel,
-        )
-        tensors = self.generate_input_tensors_from_dataframes(shape_path,mesh_df, faces_df, input_ring=input_ring)
-        return mesh_df, faces_df, tensors
+        old_selected_face_index = self.selected_face_index
+        if selected_face_index is not None:
+            self.selected_face_index = int(selected_face_index)
+        try:
+            mesh_df, faces_df = self.export_face_mesh_metric_points_triangulated(
+                shape_path=shape_path,
+                M_per_face=M_per_face,
+                pool_size_factor=pool_size_factor,
+                fps_pool_factor=fps_pool_factor,
+                use_fps=use_fps,
+                triangulation_max_edge_rel=triangulation_max_edge_rel,
+            )
+            tensors = self.generate_input_tensors_from_dataframes(shape_path,mesh_df, faces_df, input_ring=input_ring)
+            return mesh_df, faces_df, tensors
+        finally:
+            self.selected_face_index = old_selected_face_index
 
     def generate_from_file(
         self,
@@ -1571,6 +1607,7 @@ class CADTensorGenerator:
         fps_pool_factor: int = 4,
         use_fps: bool = True,
         triangulation_max_edge_rel: float = 0.35,
+        selected_face_index: int | None = None,
     ):
         """
         Full pipeline:
@@ -1591,28 +1628,34 @@ class CADTensorGenerator:
               * increase `M_per_face`
               * optionally decrease `triangulation_max_edge_rel`
         """
-        if mode == "mesh":
-            mesh_df, faces_df = self.export_face_mesh_metric(
-                shape_path=shape_path,
-                visualize=visualize,
-                visualize_face_id=visualize_face_id,
-            )
-        elif mode in ("Sampled_points", "points_triangulated"):
-            if M_per_face is None:
-                raise ValueError("M_per_face must be provided when mode='points_triangulated'.")
-            mesh_df, faces_df = self.export_face_mesh_metric_points_triangulated(
-                shape_path=shape_path,
-                M_per_face=M_per_face,
-                pool_size_factor=pool_size_factor,
-                fps_pool_factor=fps_pool_factor,
-                use_fps=use_fps,
-                triangulation_max_edge_rel=triangulation_max_edge_rel,
-            )
-        else:
-            raise ValueError(f"Unknown mode: {mode}")
+        old_selected_face_index = self.selected_face_index
+        if selected_face_index is not None:
+            self.selected_face_index = int(selected_face_index)
+        try:
+            if mode == "mesh":
+                mesh_df, faces_df = self.export_face_mesh_metric(
+                    shape_path=shape_path,
+                    visualize=visualize,
+                    visualize_face_id=visualize_face_id,
+                )
+            elif mode in ("Sampled_points", "points_triangulated"):
+                if M_per_face is None:
+                    raise ValueError("M_per_face must be provided when mode='points_triangulated'.")
+                mesh_df, faces_df = self.export_face_mesh_metric_points_triangulated(
+                    shape_path=shape_path,
+                    M_per_face=M_per_face,
+                    pool_size_factor=pool_size_factor,
+                    fps_pool_factor=fps_pool_factor,
+                    use_fps=use_fps,
+                    triangulation_max_edge_rel=triangulation_max_edge_rel,
+                )
+            else:
+                raise ValueError(f"Unknown mode: {mode}")
 
-        tensors = self.generate_input_tensors_from_dataframes(shape_path,mesh_df,  faces_df, input_ring=input_ring)
-        return mesh_df, faces_df, tensors
+            tensors = self.generate_input_tensors_from_dataframes(shape_path,mesh_df,  faces_df, input_ring=input_ring)
+            return mesh_df, faces_df, tensors
+        finally:
+            self.selected_face_index = old_selected_face_index
     @staticmethod
     def faces_ijk_to_pv_faces(faces_ijk: torch.Tensor) -> np.ndarray:
         """
