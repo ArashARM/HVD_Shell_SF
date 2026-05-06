@@ -33,10 +33,8 @@ class SeedRefiner(nn.Module):
         self.delta_head = nn.Linear(hidden, 2)
 
     def forward(self, z, uv_base, seed_id_features=None, offset_scale=1.0):
-        batch_size, n_seeds, _ = uv_base.shape
-
         # Per-seed input combines the shared latent, seed UV, and optional seed ID.
-        z_rep = z.unsqueeze(1).expand(-1, n_seeds, -1)
+        z_rep = z.unsqueeze(0).expand(uv_base.shape[0], -1)
         if seed_id_features is not None:
             seed_in = torch.cat([z_rep, uv_base, seed_id_features], dim=-1)
         else:

@@ -3670,7 +3670,7 @@ class NN_Trainer:
                 ):
                     pred_i = ppnet(uv_anchor_i, offset_scale=seed_offset_scale_step)
 
-                    seeds_raw_i = pred_i["seeds_raw"][0]
+                    seeds_raw_i = pred_i["seeds_raw"]
                     if cfg.project_seed_spacing_each_step:
                         seeds_raw_i = self.project_seed_spacing(
                             seeds_list=[seeds_raw_i],
@@ -3680,26 +3680,26 @@ class NN_Trainer:
                             clamp_to_domain=not allow_seed_outside_domain_step,
                         )[0]
                         pred_i["seeds_raw"] = pred_i["seeds_raw"].clone()
-                        pred_i["seeds_raw"][0] = seeds_raw_i
-                    w_raw_i = pred_i["w_raw"][0]
+                        pred_i["seeds_raw"] = seeds_raw_i
+                    w_raw_i = pred_i["w_raw"]
 
                     h_raw_i = None
                     if cfg.fixed_height is None and "h_raw" in pred_i:
-                        h_raw_i = pred_i["h_raw"][0]
+                        h_raw_i = pred_i["h_raw"]
 
                     theta_pred_i = pred_i.get("theta", None)
-                    theta_i = theta_pred_i[0] if (cfg.use_Metric_anisotropy and theta_pred_i is not None) else None
+                    theta_i = theta_pred_i if (cfg.use_Metric_anisotropy and theta_pred_i is not None) else None
                     a_raw_pred_i = pred_i.get("a_raw", None)
-                    a_raw_i = a_raw_pred_i[0] if (cfg.use_Metric_anisotropy and a_raw_pred_i is not None) else None
+                    a_raw_i = a_raw_pred_i if (cfg.use_Metric_anisotropy and a_raw_pred_i is not None) else None
 
                     boundary_width_pred_i = pred_i.get("boundary_width_raw", None)
-                    boundary_width_raw_i = boundary_width_pred_i[0] if boundary_width_pred_i is not None else None
+                    boundary_width_raw_i = boundary_width_pred_i if boundary_width_pred_i is not None else None
                     boundary_alpha_pred_i = pred_i.get("boundary_alpha_raw", None)
-                    boundary_alpha_raw_i = boundary_alpha_pred_i[0] if boundary_alpha_pred_i is not None else None
+                    boundary_alpha_raw_i = boundary_alpha_pred_i if boundary_alpha_pred_i is not None else None
                     boundary_beta_pred_i = pred_i.get("boundary_beta_raw", None)
-                    boundary_beta_raw_i = boundary_beta_pred_i[0] if boundary_beta_pred_i is not None else None
+                    boundary_beta_raw_i = boundary_beta_pred_i if boundary_beta_pred_i is not None else None
                     tau_pred_i = pred_i.get("tau", None)
-                    tau_step = tau_pred_i[0] if tau_pred_i is not None else tau_step
+                    tau_step = tau_pred_i if tau_pred_i is not None else tau_step
 
                     local_face_id = torch.zeros(ft["uv"].shape[0], dtype=torch.long, device=device)
 

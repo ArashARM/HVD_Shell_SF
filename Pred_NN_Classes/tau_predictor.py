@@ -50,7 +50,7 @@ class TauPredictor(nn.Module):
         if not self.predict_tau:
             return None
 
-        tau_logits = self.tau_head(z).view(-1)
+        tau_logits = self.tau_head(z).reshape(())
         tau = self.tau_pred_min + (self.tau_pred_max - self.tau_pred_min) * torch.sigmoid(tau_logits)
         check_finite(tau, "tau", self.enable_checks)
         return tau

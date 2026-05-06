@@ -23,9 +23,9 @@ class BoundaryPredictor(nn.Module):
         if not self.predict_boundary_params:
             return None, None, None
 
-        boundary_width_raw = self.boundary_width_head(z).view(-1)
-        boundary_alpha_raw = self.boundary_alpha_head(z).view(-1)
-        boundary_beta_raw = self.boundary_beta_head(z).view(-1)
+        boundary_width_raw = self.boundary_width_head(z).reshape(())
+        boundary_alpha_raw = self.boundary_alpha_head(z).reshape(())
+        boundary_beta_raw = self.boundary_beta_head(z).reshape(())
 
         check_finite(boundary_width_raw, "boundary_width_raw", self.enable_checks)
         check_finite(boundary_alpha_raw, "boundary_alpha_raw", self.enable_checks)

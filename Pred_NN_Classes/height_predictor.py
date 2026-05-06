@@ -19,6 +19,6 @@ class HeightPredictor(nn.Module):
         if not self.predict_height:
             return None
 
-        h_raw = self.h_head(z).view(-1)
+        h_raw = self.h_head(z).reshape(())
         check_finite(h_raw, "h_raw", self.enable_checks)
         return h_raw

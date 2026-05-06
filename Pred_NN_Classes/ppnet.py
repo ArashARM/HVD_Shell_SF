@@ -73,7 +73,7 @@ class PPNet(nn.Module):
         self.enable_checks = enable_checks
 
         # This model is used as an optimization parameterization for a single problem instance, so no external context conditioning is required.
-        self.global_latent = nn.Parameter(torch.zeros(1, hidden))
+        self.global_latent = nn.Parameter(torch.zeros(hidden))
         self.seed_identity = SeedIdentityEmbedding(self.n_seeds, self.seed_id_dim)
         self.seed_refiner = SeedRefiner(
             hidden=hidden,
@@ -167,27 +167,20 @@ class PPNet(nn.Module):
         n_seeds = self.n_seeds
         eps_uv = self.eps_uv
 
-        # uv_init may be shared across the batch or already batched.
-        if uv_init.dim() == 2:
-            batch_size = 1
-            uv_init_b = uv_init.unsqueeze(0).expand(batch_size, -1, -1)
-        elif uv_init.dim() == 3:
-            batch_size = uv_init.shape[0]
-            uv_init_b = uv_init
-        else:
-            raise ValueError("uv_init must be (S,2) or (B,S,2)")
+        if uv_init.dim() != 2 or uv_init.shape[-1] != 2:
+            raise ValueError("uv_init must be (S,2)")
 
         if self.allow_seed_outside_domain:
-            uv_base = uv_init_b
+            uv_base = uv_init
         else:
-            uv_base = uv_init_b.clamp(eps_uv, 1.0 - eps_uv)
+            uv_base = uv_init.clamp(eps_uv, 1.0 - eps_uv)
         self._check(uv_base, "uv_base")
 
-        z = self.global_latent.expand(batch_size, -1)
+        z = self.global_latent
         self._check(z, "z")
 
         # z + uv + seed_id_features -> SeedRefiner -> h, seeds_uv
-        seed_id_features = self.seed_identity(batch_size, n_seeds, uv_base.device)
+        seed_id_features = self.seed_identity(n_seeds, uv_base.device)
         self.seed_refiner.allow_seed_outside_domain = bool(self.allow_seed_outside_domain)
         self.seed_refiner.seed_domain_margin = float(self.seed_domain_margin)
         h, seeds_uv = self.seed_refiner(
@@ -200,7 +193,7 @@ class PPNet(nn.Module):
         # h -> seed-level/pairwise predictors
         self.width_predictor.freeze_w = self.freeze_w
         self.width_predictor.w_const = self.w_const
-        w_raw = self.width_predictor(h, batch_size, n_seeds, z)
+        w_raw = self.width_predictor(h, n_seeds, z)
         theta, a_raw = self.anisotropy_predictor(h)
 
         # z -> global predictors

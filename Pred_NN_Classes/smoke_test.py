@@ -24,6 +24,8 @@ def main():
         "tau",
     }
     assert set(out.keys()) == expected_keys
+    assert out["seeds_raw"].shape == (5, 2)
+    assert out["w_raw"].shape == (5, 5)
     print("from HDVClassnNet import PPNet works")
     print("out keys:", sorted(out.keys()))
 
