@@ -67,6 +67,8 @@ class TrainingConfig:
     boundary_attach_width_min: float = 0.005
     boundary_attach_width_max: float = 0.10
     duplicate_merge_sigma:float = 0.05
+    seed_activity_sharpness: float = 3.0
+    seed_activity_threshold: float = 0.5
 
     boundary_attach_alpha_min: float = 0.05
     boundary_attach_alpha_max: float = 1.00
@@ -105,6 +107,7 @@ class TrainingConfig:
     normalize_losses: bool = True
     fem_density_floor: float = 0.02
     skip_bad_fem_steps: bool = True
+    
 
     num_steps: int = 10000
     tau: float = 0.02
@@ -152,6 +155,8 @@ class TrainingConfig:
     early_stop_start: int = 300
     patience: int = 300
     min_delta: float = 1e-4
+    prune_inactive_on_plateau: bool = True
+    prune_patience: int | None = None
 
     min_active_seeds: int | None = None
     hard_refine_start_frac: float = 0.85
@@ -215,6 +220,15 @@ class TrainingConfig:
         if self.tau_pred_max <= self.tau_pred_min:
             raise ValueError(
                 f"tau_pred_max must be > tau_pred_min, got min={self.tau_pred_min}, max={self.tau_pred_max}"
+            )
+        if self.seed_activity_sharpness <= 0.0:
+            raise ValueError(
+                f"seed_activity_sharpness must be > 0, got {self.seed_activity_sharpness}"
+            )
+        if not (0.0 < self.seed_activity_threshold < 1.0):
+            raise ValueError(
+                "seed_activity_threshold must be in (0, 1), "
+                f"got {self.seed_activity_threshold}"
             )
         if not (self.tau_pred_min <= self.tau_pred_start <= self.tau_pred_max):
             raise ValueError(
@@ -306,6 +320,8 @@ class TrainingConfig:
             raise ValueError(f"min_active_seeds must be >= 1, got {self.min_active_seeds}")
         if self.lam_seed_active < 0.0:
             raise ValueError(f"lam_seed_active must be >= 0, got {self.lam_seed_active}")
+        if self.prune_patience is not None and self.prune_patience < 1:
+            raise ValueError(f"prune_patience must be >= 1, got {self.prune_patience}")
 
 class RunningNorm:
     def __init__(self, momentum: float = 0.99, eps: float = 1e-12):
@@ -1299,6 +1315,8 @@ class NN_Trainer:
             density_projection_threshold=self.cfg.density_projection_threshold,
             density_projection_gamma=self.cfg.density_projection_gamma,
             duplicate_merge_sigma=self.cfg.duplicate_merge_sigma,
+            seed_activity_sharpness=self.cfg.seed_activity_sharpness,
+            seed_activity_threshold=self.cfg.seed_activity_threshold,
             raw_temp=self.cfg.decoder_raw_temp,
             use_band_weighted_fiber_pairs=self.cfg.use_band_weighted_fiber_pairs,
             fiber_band_prior_power=self.cfg.fiber_band_prior_power,
@@ -1414,6 +1432,91 @@ class NN_Trainer:
             })
 
         return torch.optim.Adam(param_groups)
+
+    def _build_scheduler(self, opt, milestones):
+        cfg = self.cfg
+        if not getattr(cfg, "scheduler_milestones", None):
+            return None
+        return torch.optim.lr_scheduler.MultiStepLR(
+            opt,
+            milestones=list(milestones),
+            gamma=cfg.scheduler_gamma,
+        )
+
+    @staticmethod
+    def _copy_optimizer_lrs(src_opt, dst_opt):
+        for src_group, dst_group in zip(src_opt.param_groups, dst_opt.param_groups):
+            dst_group["lr"] = src_group.get("lr", dst_group["lr"])
+
+    @staticmethod
+    def _clone_module_state_dict(module):
+        return {
+            key: value.detach().clone()
+            for key, value in module.state_dict().items()
+        }
+
+    def _prune_inactive_seeds(
+        self,
+        ppnet,
+        decoder,
+        uv_anchor: torch.Tensor,
+        pred_i: dict,
+    ) -> tuple[bool, torch.Tensor, int, int]:
+        active_mask = pred_i.get("seed_active_mask", None)
+        if active_mask is None:
+            return False, uv_anchor, int(getattr(ppnet, "n_seeds", uv_anchor.shape[0])), 0
+
+        active_mask = active_mask.detach().to(device=uv_anchor.device, dtype=torch.bool).reshape(-1)
+        old_count = int(active_mask.numel())
+        active_idx = torch.nonzero(active_mask, as_tuple=False).flatten()
+        new_count = int(active_idx.numel())
+
+        min_keep = int(self.cfg.min_active_seeds or 1)
+        if new_count <= 0 or new_count >= old_count or new_count < min_keep:
+            return False, uv_anchor, old_count, old_count - new_count
+
+        with torch.no_grad():
+            uv_anchor_pruned = uv_anchor.index_select(0, active_idx).detach().clone()
+
+            ppnet.n_seeds = new_count
+            seed_identity = getattr(ppnet, "seed_identity", None)
+            embedding = getattr(seed_identity, "embedding", None)
+            if embedding is not None:
+                old_embedding = embedding
+                new_embedding = torch.nn.Embedding(new_count, old_embedding.embedding_dim).to(
+                    device=old_embedding.weight.device,
+                    dtype=old_embedding.weight.dtype,
+                )
+                new_embedding.weight.copy_(old_embedding.weight.index_select(0, active_idx.to(old_embedding.weight.device)))
+                seed_identity.embedding = new_embedding
+
+            decoder.n_seeds = new_count
+            decoder.seed_face_id = decoder.seed_face_id.index_select(
+                0,
+                active_idx.to(decoder.seed_face_id.device),
+            ).detach().clone()
+
+        return True, uv_anchor_pruned, old_count, old_count - new_count
+
+    @staticmethod
+    def _decoder_seed_state_for_pred(decoder, pred_i: dict, device) -> tuple[int, torch.Tensor]:
+        old_n_seeds = int(decoder.n_seeds)
+        old_seed_face_id = decoder.seed_face_id.detach().clone()
+        pred_seed_count = int(pred_i["seeds_raw"].shape[0])
+        if pred_seed_count != old_n_seeds:
+            decoder.n_seeds = pred_seed_count
+            decoder.seed_face_id = torch.zeros(
+                pred_seed_count,
+                dtype=torch.long,
+                device=device,
+            )
+        return old_n_seeds, old_seed_face_id
+
+    @staticmethod
+    def _restore_decoder_seed_state(decoder, state: tuple[int, torch.Tensor]):
+        old_n_seeds, old_seed_face_id = state
+        decoder.n_seeds = int(old_n_seeds)
+        decoder.seed_face_id = old_seed_face_id
 
     @staticmethod
     def _pair_upper_values(t: torch.Tensor) -> torch.Tensor:
@@ -2563,12 +2666,25 @@ class NN_Trainer:
     # Visualization
     # ------------------------------------------------------------------
 
+    def _get_result_final_density(self, result):
+        density = result.get("Final_shape_density", None)
+        if density is None:
+            density = result.get("best_rho", None)
+        if density is None:
+            available = ", ".join(sorted(str(k) for k in result.keys()))
+            raise KeyError(
+                "Could not find final density in result. Expected "
+                "'Final_shape_density' or legacy fallback 'best_rho'. "
+                f"Available keys: {available}"
+            )
+        return density
+
     def visualize_result_stepwise(self, result, points_xyz, faces_ijk):
         pv_faces_fixed = self.generator.faces_ijk_to_pv_faces(faces_ijk)
 
         density_init = result["Initial_shape_density"].detach().cpu().numpy()
         density_mid = result["Mid_shape_density"].detach().cpu().numpy()
-        density_final = result["Final_shape_density"].detach().cpu().numpy()
+        density_final = self._get_result_final_density(result).detach().cpu().numpy()
 
         self.viz.plot_density_and_seedpoints_3stage_2(
             mesh_points=points_xyz.detach().cpu().numpy(),
@@ -2582,7 +2698,7 @@ class NN_Trainer:
         )
 
     def visualize_result_final(self, result, points_xyz, faces_ijk, thr=0.5, show_solid=True):
-        density_fin_viz = self.viz.viz_normalize(result["Final_shape_density"])
+        density_fin_viz = self.viz.viz_normalize(self._get_result_final_density(result))
         pv_faces_fixed = self.generator.faces_ijk_to_pv_faces(faces_ijk)
 
         solid, thr_used, _ = self.viz.visualize_density_thresholded(
@@ -2955,7 +3071,7 @@ class NN_Trainer:
                 "Run training with the updated trainer result output."
             )
 
-        density = result["Final_shape_density"].detach().cpu()
+        density = self._get_result_final_density(result).detach().cpu()
         fiber = result["Final_shape_fiber_direction"].detach().cpu()
         points_xyz_cpu = points_xyz.detach().cpu()
         pv_faces_fixed = self.generator.faces_ijk_to_pv_faces(faces_ijk)
@@ -3068,7 +3184,7 @@ class NN_Trainer:
                 "Run training with the updated trainer result output."
             )
 
-        density_global = result["Final_shape_density"].detach().cpu()
+        density_global = self._get_result_final_density(result).detach().cpu()
         fiber_global = result["Final_shape_fiber_direction"].detach().cpu()
         face_tensors = result["face_tensors"]
 
@@ -3460,13 +3576,7 @@ class NN_Trainer:
 
         #print(f"scheduler_milestones: {milestones}")
 
-        scheduler = None
-        if getattr(cfg, "scheduler_milestones", None):
-            scheduler = torch.optim.lr_scheduler.MultiStepLR(
-                opt,
-                milestones=list(milestones),
-                gamma=cfg.scheduler_gamma,
-            )
+        scheduler = self._build_scheduler(opt, milestones)
 
         # ------------------------------------------------------------
         # Optional timelapse setup
@@ -3554,6 +3664,11 @@ class NN_Trainer:
         best_fiber_surface = None
         best_seeds = None
         best_pred = None
+        prune_best_score = float("inf")
+        prune_best_step = -1
+        prune_best_pred = None
+        prune_best_uv_anchor = None
+        prune_best_ppnet_state = None
         best_hard_score = float("inf")
         best_hard_vol_frac = None
         best_hard_comp = None
@@ -3568,6 +3683,7 @@ class NN_Trainer:
         # ------------------------------------------------------------
 
         steps_since_improve = 0
+        prune_events = []
         initial_shape_density = None
         mid_shape_density = None
         final_shape_density = None
@@ -3667,7 +3783,9 @@ class NN_Trainer:
                     and step >= int(round(float(cfg.seed_anchor_warmup_frac) * float(cfg.num_steps)))
                     and (anchor_update_allowed or not cfg.guard_seed_anchor_updates)
                 )
+
                 seed_offset_scale_step = self.seed_offset_scale_for_step(step)
+                #seed_offset_scale_step=cfg.Offset_scale
                 uv_anchor_next = None
 
                 ft = face_tensor
@@ -4263,6 +4381,20 @@ class NN_Trainer:
                         mid_shape_density = rho.detach().clone()
                         seed_points_mid = self._seed_points_xyz(seeds_i, face_tensor)
 
+                    prune_best_improved = (
+                        best_candidate_is_valid
+                        and score < (prune_best_score - cfg.min_delta)
+                    )
+                    if prune_best_improved:
+                        prune_best_score = score
+                        prune_best_step = step
+                        prune_best_pred = self._clone_pred_list(pred_list)
+                        prune_best_uv_anchor = uv_anchor.detach().clone()
+                        prune_best_ppnet_state = self._clone_module_state_dict(ppnet)
+                        steps_since_improve = 0
+                    elif best_candidate_is_valid:
+                        steps_since_improve += 1
+
                     if best_candidate_is_valid and score < (best_score - cfg.min_delta):
                         best_score = score
                         best_step = step
@@ -4285,9 +4417,6 @@ class NN_Trainer:
                                 f"comp={best_comp:.6e} | "
                                 f"w={best_w_geo:.6e}"
                             )
-                        steps_since_improve = 0
-                    elif best_candidate_is_valid:
-                        steps_since_improve += 1
 
                     if rho0 is None:
                         rho0 = rho.detach().clone()
@@ -4515,6 +4644,94 @@ class NN_Trainer:
                         and min_seed_dist_value >= min_seed_dist_limit
                     )
 
+                    prune_wait = int(cfg.prune_patience or cfg.patience)
+                    if (
+                        bool(cfg.prune_inactive_on_plateau)
+                        and prune_best_step >= 0
+                        and steps_since_improve >= prune_wait
+                        and prune_best_pred
+                        and prune_best_uv_anchor is not None
+                        and prune_best_ppnet_state is not None
+                    ):
+                        old_seed_count_current = int(getattr(ppnet, "n_seeds", cfg.seed_number))
+                        prune_active_mask = prune_best_pred[0].get("seed_active_mask", None)
+                        if prune_active_mask is not None:
+                            prune_active_mask = prune_active_mask.detach().to(
+                                device=prune_best_uv_anchor.device,
+                                dtype=torch.bool,
+                            ).reshape(-1)
+                            old_seed_count_for_prune = int(prune_active_mask.numel())
+                            new_seed_count_for_prune = int(prune_active_mask.to(torch.long).sum().item())
+                            removed_count_for_prune = old_seed_count_for_prune - new_seed_count_for_prune
+                        else:
+                            old_seed_count_for_prune = old_seed_count_current
+                            new_seed_count_for_prune = old_seed_count_current
+                            removed_count_for_prune = 0
+
+                        can_prune_best = (
+                            removed_count_for_prune > 0
+                            and new_seed_count_for_prune >= int(cfg.min_active_seeds or 1)
+                            and old_seed_count_for_prune == old_seed_count_current
+                        )
+                        if not can_prune_best:
+                            removed_count = removed_count_for_prune
+                            pruned = False
+                        else:
+                            ppnet.load_state_dict(prune_best_ppnet_state)
+                            pruned, uv_anchor_new, old_seed_count, removed_count = self._prune_inactive_seeds(
+                                ppnet=ppnet,
+                                decoder=decoder,
+                                uv_anchor=prune_best_uv_anchor,
+                                pred_i=prune_best_pred[0],
+                            )
+                        if pruned:
+                            pruned_from_best_step = int(prune_best_step)
+                            uv_anchor = uv_anchor_new
+                            cfg.seed_number = int(getattr(ppnet, "n_seeds", uv_anchor.shape[0]))
+                            uv_init_list = [uv_anchor.detach().clone()]
+                            opt_new = self._build_optimizer(ppnet, decoder)
+                            self._copy_optimizer_lrs(opt, opt_new)
+                            opt = opt_new
+                            remaining_milestones = [
+                                max(1, int(m) - int(step))
+                                for m in milestones
+                                if int(m) > int(step)
+                            ]
+                            scheduler = self._build_scheduler(opt, sorted(set(remaining_milestones)))
+                            seeds0 = None
+                            prune_best_score = float("inf")
+                            prune_best_step = -1
+                            prune_best_pred = None
+                            prune_best_uv_anchor = None
+                            prune_best_ppnet_state = None
+                            steps_since_improve = 0
+                            prune_events.append({
+                                "step": int(step),
+                                "pruned_from_best_step": pruned_from_best_step,
+                                "old_seed_count": int(old_seed_count),
+                                "new_seed_count": int(cfg.seed_number),
+                                "removed_count": int(removed_count),
+                            })
+                            tqdm.write(
+                                f"Pruned inactive seeds at step {step}: "
+                                f"{old_seed_count} -> {cfg.seed_number} "
+                                f"(removed {removed_count}) using best segment step "
+                                f"{prune_events[-1]['pruned_from_best_step']}. Continuing training; "
+                                f"global best remains step {best_step}."
+                            )
+                            continue
+                        if removed_count > 0:
+                            tqdm.write(
+                                f"Plateau reached at step {step}, but pruning was skipped: "
+                                f"removing {removed_count} inactive seeds would leave fewer than "
+                                f"min_active_seeds={int(cfg.min_active_seeds or 1)}."
+                            )
+                        elif old_seed_count_current <= int(cfg.min_active_seeds or 1):
+                            tqdm.write(
+                                f"Plateau reached at step {step}, but only "
+                                f"{old_seed_count_current} seed slots remain."
+                            )
+
                     if step >= cfg.early_stop_start and steps_since_improve >= cfg.patience:
                         tqdm.write(
                             f"Early stopping at step {step} | "
@@ -4545,6 +4762,7 @@ class NN_Trainer:
                     best_inactive_count = float(inactive_count_total)
 
         use_hard_result = False
+        returned_best_source = "global"
         if use_hard_result:
             best_score = best_hard_score
             best_step = best_hard_step
@@ -4557,6 +4775,7 @@ class NN_Trainer:
             best_fiber_surface = best_hard_fiber_surface
             best_seeds = best_hard_seeds
             best_pred = best_hard_pred
+            returned_best_source = "hard"
 
         # ------------------------------------------------------------
         # Final outputs
@@ -4568,6 +4787,7 @@ class NN_Trainer:
             hard_fiber_wgt = torch.zeros((vertices_number,), dtype=dtype, device=device)
             pred_i = best_pred[0] if best_pred else None
             if pred_i is not None:
+                decoder_seed_state = self._decoder_seed_state_for_pred(decoder, pred_i, device)
                 local_face_id = torch.zeros(face_tensor["uv"].shape[0], dtype=torch.long, device=device)
                 boundary_uv_i = None
                 boundary_face_id_i = None
@@ -4582,27 +4802,30 @@ class NN_Trainer:
                 seed_domain_mask_i = self._seed_domain_mask_for_face(face_tensor)
 
                 tau_i = self._fallback_tau_value() if pred_i.get("tau") is None else pred_i["tau"]
-                hard_out_i = decoder.evaluate_at_uv(
-                    points_uv=face_tensor["uv"],
-                    Xu=face_tensor["Xu"],
-                    Xv=face_tensor["Xv"],
-                    tau=tau_i,
-                    seeds_raw=pred_i["seeds_raw"],
-                    w_raw=pred_i["w_raw"],
-                    h_raw=pred_i.get("h_raw", None),
-                    theta=pred_i.get("theta", None),
-                    a_raw=pred_i.get("a_raw", None),
-                    points_face_id=local_face_id,
-                    boundary_uv=boundary_uv_i,
-                    boundary_face_id=boundary_face_id_i,
-                    boundary_width_raw=pred_i.get("boundary_width_raw", None),
-                    boundary_alpha_raw=pred_i.get("boundary_alpha_raw", None),
-                    boundary_beta_raw=pred_i.get("boundary_beta_raw", None),
-                    hard_seed_mask=True,
-                    seed_domain_mask=seed_domain_mask_i,
-                    seed_domain_mask_threshold=cfg.seed_domain_mask_threshold,
-                    seed_domain_temp=cfg.seed_domain_temp,
-                )
+                try:
+                    hard_out_i = decoder.evaluate_at_uv(
+                        points_uv=face_tensor["uv"],
+                        Xu=face_tensor["Xu"],
+                        Xv=face_tensor["Xv"],
+                        tau=tau_i,
+                        seeds_raw=pred_i["seeds_raw"],
+                        w_raw=pred_i["w_raw"],
+                        h_raw=pred_i.get("h_raw", None),
+                        theta=pred_i.get("theta", None),
+                        a_raw=pred_i.get("a_raw", None),
+                        points_face_id=local_face_id,
+                        boundary_uv=boundary_uv_i,
+                        boundary_face_id=boundary_face_id_i,
+                        boundary_width_raw=pred_i.get("boundary_width_raw", None),
+                        boundary_alpha_raw=pred_i.get("boundary_alpha_raw", None),
+                        boundary_beta_raw=pred_i.get("boundary_beta_raw", None),
+                        hard_seed_mask=True,
+                        seed_domain_mask=seed_domain_mask_i,
+                        seed_domain_mask_threshold=cfg.seed_domain_mask_threshold,
+                        seed_domain_temp=cfg.seed_domain_temp,
+                    )
+                finally:
+                    self._restore_decoder_seed_state(decoder, decoder_seed_state)
 
                 w_local = A_local.clamp_min(cfg.eps)
                 hard_rho_acc[gidx] += hard_out_i["rho"] * w_local
@@ -4630,7 +4853,7 @@ class NN_Trainer:
             f"FINAL RETURNED: best_step={best_step}, best_score={best_score:.6f} | "
             f"vol_eff={best_vol_frac:.3e}, comp={best_comp:.3e}, w_geo={best_w_geo:.3e} | "
             f"active={float(best_active_count or 0.0):.0f}, inactive={float(best_inactive_count or 0.0):.0f} | "
-            f"source={'hard' if use_hard_result else 'global'} | "
+            f"source={returned_best_source} | "
             f"time={self._format_elapsed_time(computation_time_sec)}"
         )
 
@@ -4648,7 +4871,11 @@ class NN_Trainer:
 
         if cfg.MakeTimelaps:
             try:
-                total_seed_slots = int(cfg.seed_number)
+                total_seed_slots = (
+                    int(best_pred[0]["seeds_raw"].shape[0])
+                    if best_pred
+                    else int(cfg.seed_number)
+                )
                 active_seed_count = int(round(float(best_active_count or 0.0)))
                 best_vol_total = (
                     float(best_row["vol_frac"])
@@ -4728,14 +4955,21 @@ class NN_Trainer:
                 )
                 tuned_param_title = " | ".join(f"{key}={value}" for key, value in tuned_param_summary.items())
 
-                best_cad_img = self._render_current_cad_frame_cached(
-                    seeds_list=best_seeds,
-                    decoders=decoders,
-                    pred_list=best_pred,
-                    render_cache=render_cache,
-                    thr=getattr(cfg, "vis_thr", cfg.TM_laps_Thr),
-                    loading_img=self.timelapse_loading_img,
-                )
+                decoder_seed_state = None
+                if best_pred:
+                    decoder_seed_state = self._decoder_seed_state_for_pred(decoder, best_pred[0], device)
+                try:
+                    best_cad_img = self._render_current_cad_frame_cached(
+                        seeds_list=best_seeds,
+                        decoders=decoders,
+                        pred_list=best_pred,
+                        render_cache=render_cache,
+                        thr=getattr(cfg, "vis_thr", cfg.TM_laps_Thr),
+                        loading_img=self.timelapse_loading_img,
+                    )
+                finally:
+                    if decoder_seed_state is not None:
+                        self._restore_decoder_seed_state(decoder, decoder_seed_state)
                 best_frame_path = recorder.add_frame(
                     step=cfg.num_steps + 1,
                     cad_img=best_cad_img,
@@ -4762,6 +4996,7 @@ class NN_Trainer:
             "ppnets": ppnets,
             "optimizer": opt,
             "history": history,
+            "prune_events": prune_events,
             "best_score": best_score,
             "best_step": best_step,
             "best_active_count": float(best_active_count or 0.0),
@@ -4770,7 +5005,7 @@ class NN_Trainer:
             "best_hard_step": best_hard_step,
             "best_hard_active_count": float(best_hard_active_count or 0.0),
             "best_hard_inactive_count": float(best_hard_inactive_count or 0.0),
-            "returned_best_source": "hard" if use_hard_result else "global",
+            "returned_best_source": returned_best_source,
             "best_rho": best_rho,
             "best_seeds": best_seeds,
             "best_pred": best_pred,

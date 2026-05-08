@@ -70,6 +70,8 @@ class VoronoiDecoder(nn.Module):
         duplicate_effect_temp_ratio: float = 0.20,
         duplicate_effect_strength: float = 6.0,
         duplicate_effect_floor: float = 5e-2,
+        seed_activity_sharpness: float = 1.0,
+        seed_activity_threshold: float = 0.5,
         domain_effect_floor: float = 1e-8,
         domain_pair_power: float = 2.0,
         duplicate_pair_power: float = 1.0,
@@ -143,6 +145,8 @@ class VoronoiDecoder(nn.Module):
         self.duplicate_effect_temp_ratio = float(duplicate_effect_temp_ratio)
         self.duplicate_effect_strength = float(duplicate_effect_strength)
         self.duplicate_effect_floor = float(duplicate_effect_floor)
+        self.seed_activity_sharpness = float(seed_activity_sharpness)
+        self.seed_activity_threshold = float(seed_activity_threshold)
         self.domain_effect_floor = float(domain_effect_floor)
         self.domain_pair_power = float(
             domain_pair_power if pair_activity_power is None else pair_activity_power
@@ -207,6 +211,15 @@ class VoronoiDecoder(nn.Module):
         if not (0.0 < self.duplicate_effect_floor <= 1.0):
             raise ValueError(
                 f"duplicate_effect_floor must be in (0, 1], got {self.duplicate_effect_floor}"
+            )
+        if self.seed_activity_sharpness <= 0.0:
+            raise ValueError(
+                f"seed_activity_sharpness must be > 0, got {self.seed_activity_sharpness}"
+            )
+        if not (0.0 < self.seed_activity_threshold < 1.0):
+            raise ValueError(
+                "seed_activity_threshold must be in (0, 1), "
+                f"got {self.seed_activity_threshold}"
             )
         if not (0.0 < self.domain_effect_floor <= 1.0):
             raise ValueError(
@@ -427,6 +440,27 @@ class VoronoiDecoder(nn.Module):
 
         return weight.clamp(0.0, 1.0), active, sdf_values, mask_values
 
+    def _sharpen_seed_activity(self, weights: torch.Tensor) -> torch.Tensor:
+        weights = weights.clamp(0.0, 1.0)
+        if self.seed_activity_sharpness == 1.0:
+            return weights
+
+        sharpness = torch.as_tensor(
+            self.seed_activity_sharpness,
+            device=weights.device,
+            dtype=weights.dtype,
+        ).clamp_min(self.eps)
+        threshold = torch.as_tensor(
+            self.seed_activity_threshold,
+            device=weights.device,
+            dtype=weights.dtype,
+        )
+        temp = (0.25 / sharpness).clamp_min(self.eps)
+        raw = torch.sigmoid((weights - threshold) / temp)
+        lo = torch.sigmoid((torch.zeros_like(threshold) - threshold) / temp)
+        hi = torch.sigmoid((torch.ones_like(threshold) - threshold) / temp)
+        return ((raw - lo) / (hi - lo).clamp_min(self.eps)).clamp(0.0, 1.0)
+
     def _point_domain_validity_state(
         self,
         points_uv: torch.Tensor,
@@ -529,6 +563,7 @@ class VoronoiDecoder(nn.Module):
             duplicate_weight = torch.ones_like(domain_weight)
             domain_activity = domain_floor + (1.0 - domain_floor) * domain_weight
             weights = duplicate_weight * domain_activity
+            weights = self._sharpen_seed_activity(weights)
             if hard_seed_mask:
                 weights = weights * active.to(seeds.dtype)
             return weights, active, domain_weight, sdf_values, mask_values, duplicate_weight, domain_activity
@@ -589,6 +624,7 @@ class VoronoiDecoder(nn.Module):
         active = active & uv_domain_active
         domain_activity = domain_floor + (1.0 - domain_floor) * domain_weight
         weights = duplicate_weight * domain_activity
+        weights = self._sharpen_seed_activity(weights)
         if hard_seed_mask:
             weights = weights * active.to(seeds.dtype)
         return weights, active, domain_weight, sdf_values, mask_values, duplicate_weight, domain_activity
@@ -1905,6 +1941,7 @@ class VoronoiModelVisualizer:
         density_projection_strength: float = 0.0,
         density_projection_threshold: float = 0.5,
         density_projection_gamma: float = 0.05,
+        seed_activity_sharpness: float = 1.0,
         **decoder_kwargs,
     ) -> None:
         self.device = torch.device(device) if device is not None else torch.device("cpu")
@@ -1968,6 +2005,7 @@ class VoronoiModelVisualizer:
             density_projection_strength = density_projection_strength,
             density_projection_threshold = density_projection_threshold,
             density_projection_gamma = density_projection_gamma,
+            seed_activity_sharpness = seed_activity_sharpness,
             **decoder_kwargs,
         ).to(device=self.device, dtype=self.dtype)
         self.decoder.eval()
