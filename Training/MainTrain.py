@@ -1,9 +1,11 @@
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+import importlib
 import math
 import os
 import shutil
 import time
 from datetime import datetime
+from typing import Any
 
 import cv2
 import torch
@@ -37,6 +39,50 @@ except ImportError:
     from Loss_Wactive import Loss_Wactive
     from Loss_rep import Loss_rep
     from Loss_strut import Loss_strut
+
+
+def compute_w_min_from_min_feature_size_3d(
+    Xu: torch.Tensor,
+    Xv: torch.Tensor,
+    min_feature_size_3d: float,
+    safety_factor: float = 1.0,
+    stat: str = "median",
+    eps: float = 1e-8,
+) -> float:
+    """
+    Convert printer minimum printable full-width in 3D units
+    into decoder UV half-width w_min.
+
+    VoronoiDecoder.w_min is a UV half-width.
+    min_feature_size_3d is a 3D full-width.
+    """
+    if min_feature_size_3d <= 0:
+        raise ValueError("min_feature_size_3d must be > 0")
+
+    Xu_norm = torch.linalg.norm(Xu, dim=-1)
+    Xv_norm = torch.linalg.norm(Xv, dim=-1)
+
+    local_scale = torch.minimum(Xu_norm, Xv_norm)
+    local_scale = local_scale[torch.isfinite(local_scale)]
+    local_scale = local_scale[local_scale > eps]
+
+    if local_scale.numel() == 0:
+        raise ValueError("Could not compute valid UV-to-3D scale from Xu/Xv")
+
+    if stat == "median":
+        scale = local_scale.median()
+    elif stat == "mean":
+        scale = local_scale.mean()
+    elif stat == "min":
+        scale = local_scale.min()
+    else:
+        raise ValueError("stat must be one of: median, mean, min")
+
+    min_radius_3d = 0.5 * float(min_feature_size_3d) * float(safety_factor)
+    w_min_uv = min_radius_3d / scale.clamp_min(eps)
+
+
+    return float(w_min_uv.detach().cpu())
 
 
 @dataclass
@@ -79,6 +125,8 @@ class TrainingConfig:
     predict_tau: bool = None
 
     w_min: float = 0.005
+    min_feature_size_3d: float | None = None
+    auto_update_wmin: bool = False
     w_max_ratio: float = 0.5  # Deprecated: pairwise widths now use 0.8 * seed distance as the upper bound.
 
     lam_fem: float = 1.0
@@ -143,8 +191,11 @@ class TrainingConfig:
     seed_domain_temp: float = 0.05
     seed_domain_mask_support_scale: float = 2.5
     seed_domain_mask_max_points: int = 2048
+    use_independent_seed_offsets: bool = True
+    independent_seed_offset_max: float = 0.05
 
     lr_seed_refine: float = 1e-1
+    lr_independent_seed_offsets: float = 1e-3
     lr_delta_head: float = 2e-4
     lr_mlp: float = 2e-4
     lr_w_head: float = 2e-4
@@ -303,6 +354,16 @@ class TrainingConfig:
                 "seed_domain_mask_max_points must be >= 1, "
                 f"got {self.seed_domain_mask_max_points}"
             )
+        if self.independent_seed_offset_max < 0.0:
+            raise ValueError(
+                "independent_seed_offset_max must be >= 0, "
+                f"got {self.independent_seed_offset_max}"
+            )
+        if self.lr_independent_seed_offsets < 0.0:
+            raise ValueError(
+                "lr_independent_seed_offsets must be >= 0, "
+                f"got {self.lr_independent_seed_offsets}"
+            )
         if self.seed_offset_scale_start is not None and self.seed_offset_scale_start <= 0.0:
             raise ValueError(
                 f"seed_offset_scale_start must be > 0, got {self.seed_offset_scale_start}"
@@ -322,6 +383,15 @@ class TrainingConfig:
             raise ValueError(f"lam_seed_active must be >= 0, got {self.lam_seed_active}")
         if self.prune_patience is not None and self.prune_patience < 1:
             raise ValueError(f"prune_patience must be >= 1, got {self.prune_patience}")
+        if self.auto_update_wmin:
+            if self.min_feature_size_3d is None:
+                raise ValueError(
+                    "min_feature_size_3d must be set when auto_update_wmin=True"
+                )
+            if self.min_feature_size_3d <= 0.0:
+                raise ValueError(
+                    f"min_feature_size_3d must be > 0, got {self.min_feature_size_3d}"
+                )
 
 class RunningNorm:
     def __init__(self, momentum: float = 0.99, eps: float = 1e-12):
@@ -340,6 +410,715 @@ class RunningNorm:
         else:
             self.val = self.momentum * self.val + (1.0 - self.momentum) * x
         return max(self.val, 1e-8)
+
+
+def _cpu_detached_tree(value):
+    if torch.is_tensor(value):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {k: _cpu_detached_tree(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_cpu_detached_tree(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_cpu_detached_tree(v) for v in value)
+    return value
+
+
+def _tree_to_device(value, device=None, dtype=None):
+    if torch.is_tensor(value):
+        out = value.to(device=device) if device is not None else value
+        if dtype is not None and out.is_floating_point():
+            out = out.to(dtype=dtype)
+        return out
+    if isinstance(value, dict):
+        return {k: _tree_to_device(v, device=device, dtype=dtype) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_tree_to_device(v, device=device, dtype=dtype) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_tree_to_device(v, device=device, dtype=dtype) for v in value)
+    return value
+
+
+def _import_symbol(module_name: str, class_name: str):
+    module = importlib.import_module(module_name)
+    return getattr(module, class_name)
+
+
+class OptimizedShellFunction:
+    """
+    Reloadable single-face implicit shell field.
+
+    The object evaluates the optimized decoder field on UV points:
+        (u, v), Xu, Xv -> density rho and 3D fiber direction.
+    """
+
+    package_version = 1
+
+    def __init__(self, package: dict[str, Any], decoder_cls=None, device=None):
+        self.package = package
+        self.device = torch.device(device) if device is not None else torch.device("cpu")
+
+        if decoder_cls is None:
+            decoder_info = package.get("decoder_class", {})
+            decoder_cls = _import_symbol(
+                decoder_info.get("module", "Decoder_CLasses.VoronoiDecorder"),
+                decoder_info.get("name", "VoronoiDecoder"),
+            )
+        self.decoder_cls = decoder_cls
+
+        self.config = package.get("config", {})
+        self.decoder_init_kwargs = _tree_to_device(
+            package["decoder_init_kwargs"],
+            device=self.device,
+        )
+        self.decoder = self.decoder_cls(**self.decoder_init_kwargs).to(self.device)
+        state = package.get("decoder_state_dict", None)
+        if state:
+            self.decoder.load_state_dict(_tree_to_device(state, device=self.device))
+        self.decoder.eval()
+
+        self.best_pred = _tree_to_device(package["best_pred"], device=self.device)
+        self.face_metadata = package.get("face_metadata", {})
+
+    @classmethod
+    def load(cls, path, decoder_cls=None, device=None):
+        try:
+            package = torch.load(path, map_location=device or "cpu", weights_only=False)
+        except TypeError:
+            package = torch.load(path, map_location=device or "cpu")
+        return cls(package=package, decoder_cls=decoder_cls, device=device)
+
+    @staticmethod
+    def _true_open_boundary_idx(ft, tol=None):
+        if ("boundary_idx_ring1" not in ft) or ft["boundary_idx_ring1"] is None:
+            return torch.empty(0, dtype=torch.long, device=ft["uv"].device)
+
+        bidx = torch.unique(ft["boundary_idx_ring1"].to(dtype=torch.long))
+        if bidx.numel() == 0:
+            return bidx
+
+        uv = ft["uv"]
+        u = uv[:, 0]
+        v = uv[:, 1]
+        u_periodic = bool(ft.get("u_periodic", False))
+        v_periodic = bool(ft.get("v_periodic", False))
+
+        if tol is None:
+            u_span = (u.max() - u.min()).abs()
+            v_span = (v.max() - v.min()).abs()
+            base_span = torch.maximum(
+                u_span,
+                v_span,
+            ).clamp_min(torch.as_tensor(1.0, device=uv.device, dtype=uv.dtype))
+            tol = 1e-4 * float(base_span.detach().item())
+
+        ub = u[bidx]
+        vb = v[bidx]
+        keep = torch.ones_like(bidx, dtype=torch.bool)
+
+        if u_periodic:
+            umin = u.min()
+            umax = u.max()
+            is_u_seam = (ub - umin).abs() <= tol
+            is_u_seam = is_u_seam | ((ub - umax).abs() <= tol)
+            keep = keep & (~is_u_seam)
+
+        if v_periodic:
+            vmin = v.min()
+            vmax = v.max()
+            is_v_seam = (vb - vmin).abs() <= tol
+            is_v_seam = is_v_seam | ((vb - vmax).abs() <= tol)
+            keep = keep & (~is_v_seam)
+
+        return bidx[keep]
+
+    def _seed_domain_mask_for_face(self, ft):
+        if not bool(self.config.get("use_seed_domain_mask", False)):
+            return None
+
+        mask_grid = ft.get("seed_domain_mask_grid", None)
+        if mask_grid is not None:
+            return mask_grid
+
+        uv_face = ft.get("seed_domain_uv_support", ft["uv"])
+        if uv_face.numel() == 0:
+            return None
+
+        cfg = self.config
+        uv_support = uv_face.detach()
+        max_points = int(cfg.get("seed_domain_mask_max_points", 2048))
+        if uv_support.shape[0] > max_points:
+            sample_idx = torch.linspace(
+                0,
+                uv_support.shape[0] - 1,
+                max_points,
+                device=uv_support.device,
+            ).round().to(torch.long)
+            uv_support = uv_support[sample_idx]
+
+        sigma_value = ft.get("seed_domain_sigma", None)
+        if sigma_value is None:
+            sigma = NN_Trainer._estimate_uv_mask_tol(
+                uv_support,
+                u_periodic=bool(ft.get("u_periodic", False)),
+                v_periodic=bool(ft.get("v_periodic", False)),
+                fallback=float(cfg.get("boundary_margin", 0.05)),
+                scale=float(cfg.get("seed_domain_mask_support_scale", 2.5)),
+            )
+        elif torch.is_tensor(sigma_value):
+            sigma = float(sigma_value.detach().cpu().item())
+        else:
+            sigma = float(sigma_value)
+        sigma = max(float(sigma), float(cfg.get("eps", 1e-12)))
+        u_periodic = bool(ft.get("u_periodic", False))
+        v_periodic = bool(ft.get("v_periodic", False))
+
+        def mask_fn(seeds):
+            support = uv_support.to(device=seeds.device, dtype=seeds.dtype)
+            diff = seeds.unsqueeze(1) - support.unsqueeze(0)
+            if u_periodic:
+                du = diff[..., 0]
+                diff[..., 0] = du - torch.round(du)
+            if v_periodic:
+                dv = diff[..., 1]
+                diff[..., 1] = dv - torch.round(dv)
+            dmin = torch.norm(diff, dim=-1).amin(dim=1)
+            sigma_t = torch.as_tensor(sigma, device=seeds.device, dtype=seeds.dtype)
+            return torch.exp(-0.5 * (dmin / sigma_t.clamp_min(float(cfg.get("eps", 1e-12)))).pow(2))
+
+        return mask_fn
+
+    def evaluate_at_uv(
+        self,
+        points_uv,
+        Xu,
+        Xv,
+        face_tensor=None,
+        boundary_uv=None,
+        hard_seed_mask=True,
+    ):
+        points_uv = torch.as_tensor(points_uv, device=self.device)
+        dtype = points_uv.dtype if points_uv.is_floating_point() else torch.float32
+        points_uv = points_uv.to(dtype=dtype)
+        Xu = torch.as_tensor(Xu, device=self.device, dtype=dtype)
+        Xv = torch.as_tensor(Xv, device=self.device, dtype=dtype)
+
+        ft = None
+        if face_tensor is not None:
+            ft = _tree_to_device(dict(face_tensor), device=self.device, dtype=dtype)
+
+        points_face_id = torch.zeros(points_uv.shape[0], dtype=torch.long, device=self.device)
+        boundary_face_id = None
+        if boundary_uv is None and ft is not None:
+            bidx = self._true_open_boundary_idx(ft)
+            if bidx.numel() > 0:
+                boundary_uv = ft["uv"][bidx]
+                boundary_face_id = torch.zeros(
+                    boundary_uv.shape[0],
+                    dtype=torch.long,
+                    device=self.device,
+                )
+        elif boundary_uv is not None:
+            boundary_uv = torch.as_tensor(boundary_uv, device=self.device, dtype=dtype)
+            boundary_face_id = torch.zeros(
+                boundary_uv.shape[0],
+                dtype=torch.long,
+                device=self.device,
+            )
+
+        seed_domain_mask = self._seed_domain_mask_for_face(ft) if ft is not None else None
+        pred = _tree_to_device(self.best_pred, device=self.device, dtype=dtype)
+        tau = pred.get("tau", None)
+        if tau is None:
+            tau = float(self.config.get("tau", 0.02))
+
+        with torch.no_grad():
+            return self.decoder.evaluate_at_uv(
+                points_uv=points_uv,
+                Xu=Xu,
+                Xv=Xv,
+                tau=tau,
+                seeds_raw=pred["seeds_raw"],
+                w_raw=pred["w_raw"],
+                h_raw=pred.get("h_raw", None),
+                theta=pred.get("theta", None),
+                a_raw=pred.get("a_raw", None),
+                points_face_id=points_face_id,
+                boundary_uv=boundary_uv,
+                boundary_face_id=boundary_face_id,
+                boundary_width_raw=pred.get("boundary_width_raw", None),
+                boundary_alpha_raw=pred.get("boundary_alpha_raw", None),
+                boundary_beta_raw=pred.get("boundary_beta_raw", None),
+                hard_seed_mask=hard_seed_mask,
+                seed_domain_mask=seed_domain_mask,
+                seed_domain_mask_threshold=float(self.config.get("seed_domain_mask_threshold", 0.5)),
+                seed_domain_temp=float(self.config.get("seed_domain_temp", 0.05)),
+            )
+
+    def evaluate_face(self, face_tensor, hard_seed_mask=True):
+        return self.evaluate_at_uv(
+            points_uv=face_tensor["uv"],
+            Xu=face_tensor["Xu"],
+            Xv=face_tensor["Xv"],
+            face_tensor=face_tensor,
+            hard_seed_mask=hard_seed_mask,
+        )
+
+    def build_fem_fields(self, shell_problem, face_tensor, rho_void=1e-3, hard_seed_mask=True):
+        out = self.evaluate_face(face_tensor, hard_seed_mask=hard_seed_mask)
+        return shell_problem.build_fem_fields_from_decoder_torch(
+            rho_surface=out["rho"],
+            fiber_surface=out["fiber3d"],
+            rho_void=rho_void,
+        )
+
+
+def evaluate_optimized_shell_function(
+    optimized_function,
+    face_tensors,
+    face_index: int = 0,
+    hard_seed_mask: bool = True,
+):
+    """
+    Evaluate a loaded optimized single-face shell function on a face tensor.
+
+    Returns surface density and 3D fiber direction, ready for later
+    visualization or export to a custom FEM workflow.
+    """
+    if isinstance(face_tensors, dict) and "face_tensors" in face_tensors:
+        face_tensors = face_tensors["face_tensors"]
+
+    if isinstance(face_tensors, (list, tuple)):
+        face_tensor = face_tensors[int(face_index)]
+    else:
+        face_tensor = face_tensors
+
+    out = optimized_function.evaluate_face(
+        face_tensor,
+        hard_seed_mask=hard_seed_mask,
+    )
+    density = out["rho"]
+    fiber_2d = out.get("t_uv", out.get("t_uv_raw", None))
+    fiber_3d = out["fiber3d"]
+    return {
+        "2d_density": density,
+        "2d_fiberDir": fiber_2d,
+        "3d_density": density,
+        "3d_fiberDir": fiber_3d,
+        "density": density,
+        "fiber_direction": fiber_3d,
+        "rho": density,
+        "fiber3d": fiber_3d,
+        "t_uv": fiber_2d,
+        "decoder_output": out,
+        "face_tensor": face_tensor,
+    }
+
+
+def load_optimized_shell_function(path, decoder_cls=None, device=None):
+    return OptimizedShellFunction.load(path, decoder_cls=decoder_cls, device=device)
+
+
+def _field_to_numpy(value):
+    if torch.is_tensor(value):
+        return value.detach().cpu().numpy()
+    return np.asarray(value)
+
+
+def _surface_density_volume_fraction(face_tensor, density_values):
+    density = np.asarray(density_values, dtype=np.float64).reshape(-1)
+    faces = _field_to_numpy(face_tensor.get("faces_ijk", np.empty((0, 3)))).astype(np.int64)
+
+    if faces.size == 0:
+        valid = np.isfinite(density)
+        value = float(np.mean(density[valid])) if np.any(valid) else float("nan")
+        return value, "point-mean"
+
+    face_areas_raw = face_tensor.get("face_areas", None)
+    if face_areas_raw is not None:
+        face_areas = _field_to_numpy(face_areas_raw).reshape(-1).astype(np.float64)
+    else:
+        xyz = _field_to_numpy(face_tensor["points_xyz"]).astype(np.float64)
+        tri = xyz[faces]
+        face_areas = 0.5 * np.linalg.norm(
+            np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]),
+            axis=1,
+        )
+
+    if face_areas.shape[0] != faces.shape[0]:
+        valid = np.isfinite(density)
+        value = float(np.mean(density[valid])) if np.any(valid) else float("nan")
+        return value, "point-mean"
+
+    weights = np.zeros((density.shape[0],), dtype=np.float64)
+    local_weight = face_areas / 3.0
+    np.add.at(weights, faces[:, 0], local_weight)
+    np.add.at(weights, faces[:, 1], local_weight)
+    np.add.at(weights, faces[:, 2], local_weight)
+
+    valid = np.isfinite(density) & np.isfinite(weights) & (weights > 0.0)
+    if not np.any(valid):
+        return float("nan"), "area-weighted"
+    return float(np.sum(density[valid] * weights[valid]) / np.sum(weights[valid])), "area-weighted"
+
+
+def visualize_optimized_shell_fields(
+    fields,
+    show_2d: bool = True,
+    show_3d: bool = True,
+    density_cmap: str = "viridis",
+    fiber_stride: int = 20,
+    fiber_min_density: float = 0.05,
+    fiber_scale_2d: float = 0.06,
+    fiber_scale_3d: float | None = None,
+    fiber_vector_style: str = "arrow",
+    fiber_color: str = "#1f4fa3",
+    show_fiber_surface: bool = True,
+    fiber_surface_opacity: float = 0.25,
+    show_fiber_background: bool = False,
+    show_edges: bool = False,
+    window_size: tuple[int, int] = (1500, 700),
+):
+    """
+    Visualize loaded optimized shell fields in UV and on the 3D surface.
+
+    Returns a dictionary with optional:
+        uv_fig: matplotlib figure for 2D UV density/fiber
+        plotter: pyvista plotter for 3D density/fiber
+    """
+    face_tensor = fields["face_tensor"]
+    uv = _field_to_numpy(face_tensor["uv"]).astype(np.float64)
+    xyz = _field_to_numpy(face_tensor["points_xyz"]).astype(np.float64)
+    faces = _field_to_numpy(face_tensor["faces_ijk"]).astype(np.int64)
+
+    density_2d = _field_to_numpy(fields["2d_density"]).reshape(-1).astype(np.float64)
+    fiber_2d = _field_to_numpy(fields["2d_fiberDir"]).reshape(-1, 2).astype(np.float64)
+    density_3d = _field_to_numpy(fields["3d_density"]).reshape(-1).astype(np.float64)
+    fiber_3d = _field_to_numpy(fields["3d_fiberDir"]).reshape(-1, 3).astype(np.float64)
+
+    result = {}
+
+    if show_2d:
+        fig, axes = plt.subplots(1, 2, figsize=(13, 5), constrained_layout=True)
+        ax_density, ax_fiber = axes
+
+        if faces.size > 0:
+            density_artist = ax_density.tripcolor(
+                uv[:, 0],
+                uv[:, 1],
+                faces,
+                density_2d,
+                shading="gouraud",
+                cmap=density_cmap,
+                vmin=0.0,
+                vmax=1.0,
+            )
+        else:
+            density_artist = ax_density.scatter(
+                uv[:, 0],
+                uv[:, 1],
+                c=density_2d,
+                s=10,
+                cmap=density_cmap,
+                vmin=0.0,
+                vmax=1.0,
+                linewidths=0,
+            )
+        ax_density.set_title("2D UV Density")
+        ax_density.set_xlabel("u")
+        ax_density.set_ylabel("v")
+        ax_density.set_aspect("equal", adjustable="box")
+        fig.colorbar(density_artist, ax=ax_density, label="density")
+
+        if show_fiber_background and faces.size > 0:
+            ax_fiber.tripcolor(
+                uv[:, 0],
+                uv[:, 1],
+                faces,
+                density_2d,
+                shading="gouraud",
+                cmap=density_cmap,
+                vmin=0.0,
+                vmax=1.0,
+                alpha=0.30,
+            )
+        elif show_fiber_background:
+            ax_fiber.scatter(
+                uv[:, 0],
+                uv[:, 1],
+                c=density_2d,
+                s=10,
+                cmap=density_cmap,
+                vmin=0.0,
+                vmax=1.0,
+                alpha=0.30,
+                linewidths=0,
+            )
+
+        fiber_norm_2d = np.linalg.norm(fiber_2d, axis=1)
+        mask_2d = np.isfinite(density_2d) & np.isfinite(fiber_2d).all(axis=1)
+        mask_2d &= density_2d >= float(fiber_min_density)
+        mask_2d &= fiber_norm_2d > 1e-12
+        if fiber_stride > 1:
+            stride_mask = np.zeros(mask_2d.shape[0], dtype=bool)
+            stride_mask[::int(fiber_stride)] = True
+            mask_2d &= stride_mask
+
+        if np.any(mask_2d):
+            ax_fiber.quiver(
+                uv[mask_2d, 0],
+                uv[mask_2d, 1],
+                fiber_2d[mask_2d, 0],
+                fiber_2d[mask_2d, 1],
+                density_2d[mask_2d],
+                cmap=density_cmap,
+                angles="xy",
+                scale_units="xy",
+                scale=max(float(fiber_scale_2d), 1e-8) ** -1,
+                width=0.003,
+                pivot="mid",
+            )
+        ax_fiber.set_title("2D UV Fiber Direction")
+        ax_fiber.set_xlabel("u")
+        ax_fiber.set_ylabel("v")
+        ax_fiber.set_aspect("equal", adjustable="box")
+        result["uv_fig"] = fig
+
+    if show_3d:
+        volume_fraction, volume_fraction_method = _surface_density_volume_fraction(
+            face_tensor,
+            density_3d,
+        )
+        result["density_volume_fraction"] = volume_fraction
+        result["density_volume_fraction_method"] = volume_fraction_method
+        print(
+            "3D density volume fraction "
+            f"({volume_fraction_method}): {volume_fraction:.6f}"
+        )
+
+        if faces.size > 0:
+            pv_faces = np.empty((faces.shape[0], 4), dtype=np.int64)
+            pv_faces[:, 0] = 3
+            pv_faces[:, 1:] = faces
+            mesh = pv.PolyData(xyz, pv_faces.reshape(-1))
+        else:
+            mesh = pv.PolyData(xyz)
+        mesh["density"] = density_3d.astype(np.float32)
+
+        plotter = pv.Plotter(shape=(1, 2), window_size=window_size)
+
+        plotter.subplot(0, 0)
+        plotter.add_text("3D Surface Density", font_size=10)
+        plotter.add_mesh(
+            mesh,
+            scalars="density",
+            cmap=density_cmap,
+            clim=[0.0, 1.0],
+            show_edges=show_edges,
+        )
+        plotter.show_axes()
+
+        plotter.subplot(0, 1)
+        plotter.add_text("3D Surface Fiber Direction", font_size=10)
+        if show_fiber_background:
+            plotter.add_mesh(
+                mesh.copy(),
+                scalars="density",
+                cmap=density_cmap,
+                clim=[0.0, 1.0],
+                opacity=0.30,
+                show_edges=show_edges,
+            )
+        elif show_fiber_surface:
+            plotter.add_mesh(
+                mesh.copy(),
+                color="white",
+                opacity=float(fiber_surface_opacity),
+                show_edges=False,
+                smooth_shading=True,
+            )
+
+        fiber_norm_3d = np.linalg.norm(fiber_3d, axis=1)
+        mask_3d = np.isfinite(density_3d) & np.isfinite(fiber_3d).all(axis=1)
+        mask_3d &= density_3d >= float(fiber_min_density)
+        mask_3d &= fiber_norm_3d > 1e-12
+        if fiber_stride > 1:
+            stride_mask = np.zeros(mask_3d.shape[0], dtype=bool)
+            stride_mask[::int(fiber_stride)] = True
+            mask_3d &= stride_mask
+
+        if np.any(mask_3d):
+            diag = float(np.linalg.norm(np.ptp(xyz, axis=0)))
+            glyph_scale = 0.04 * max(diag, 1e-6) if fiber_scale_3d is None else float(fiber_scale_3d)
+            cloud = pv.PolyData(xyz[mask_3d])
+            cloud["vectors"] = fiber_3d[mask_3d].astype(np.float32)
+            cloud["density"] = density_3d[mask_3d].astype(np.float32)
+            style = str(fiber_vector_style).lower()
+            if style == "arrow":
+                glyph_geom = pv.Arrow(
+                    start=(0.0, 0.0, 0.0),
+                    direction=(1.0, 0.0, 0.0),
+                    tip_length=0.30,
+                    tip_radius=0.045,
+                    shaft_radius=0.014,
+                    shaft_resolution=8,
+                    tip_resolution=12,
+                )
+            elif style == "line":
+                glyph_geom = pv.Line(pointa=(0, 0, 0), pointb=(1, 0, 0))
+            else:
+                raise ValueError("fiber_vector_style must be 'arrow' or 'line'")
+            glyphs = cloud.glyph(
+                orient="vectors",
+                scale=False,
+                factor=glyph_scale,
+                geom=glyph_geom,
+            )
+            plotter.add_mesh(glyphs, color=fiber_color, line_width=2)
+
+        plotter.show_axes()
+        plotter.link_views()
+        result["plotter"] = plotter
+
+    return result
+
+
+def visualize_optimized_shell_fields_2d(fields, **kwargs):
+    return visualize_optimized_shell_fields(
+        fields,
+        show_2d=True,
+        show_3d=False,
+        **kwargs,
+    )["uv_fig"]
+
+
+def visualize_optimized_shell_fields_3d(fields, **kwargs):
+    return visualize_optimized_shell_fields(
+        fields,
+        show_2d=False,
+        show_3d=True,
+        **kwargs,
+    )["plotter"]
+
+
+def binarize_optimized_shell_fields(
+    fields,
+    density_threshold: float = 0.5,
+    solid_density: float = 1.0,
+    void_density: float = 1e-3,
+    mask_void_fibers: bool = True,
+):
+    """
+    Convert optimized continuous surface density to solid/void density.
+
+    Fiber directions are directions, so they are not thresholded into binary
+    values. They are normalized and optionally zeroed in void regions.
+    """
+    out = dict(fields)
+    density = fields["3d_density"]
+    fiber_2d = fields.get("2d_fiberDir", None)
+    fiber_3d = fields["3d_fiberDir"]
+
+    solid_mask = density >= float(density_threshold)
+    binary_density = torch.where(
+        solid_mask,
+        torch.as_tensor(solid_density, dtype=density.dtype, device=density.device),
+        torch.as_tensor(void_density, dtype=density.dtype, device=density.device),
+    )
+
+    def normalize_and_mask(fiber):
+        if fiber is None:
+            return None
+        norm = torch.linalg.norm(fiber, dim=1, keepdim=True).clamp_min(1e-12)
+        fiber_out = fiber / norm
+        if mask_void_fibers:
+            fiber_out = torch.where(solid_mask[:, None], fiber_out, torch.zeros_like(fiber_out))
+        return fiber_out
+
+    binary_fiber_2d = normalize_and_mask(fiber_2d)
+    binary_fiber_3d = normalize_and_mask(fiber_3d)
+
+    out["2d_density_continuous"] = fields["2d_density"]
+    out["3d_density_continuous"] = fields["3d_density"]
+    out["2d_fiberDir_continuous"] = fields.get("2d_fiberDir", None)
+    out["3d_fiberDir_continuous"] = fields["3d_fiberDir"]
+
+    out["solid_mask"] = solid_mask
+    out["2d_density"] = binary_density
+    out["3d_density"] = binary_density
+    out["density"] = binary_density
+    out["rho"] = binary_density
+
+    if binary_fiber_2d is not None:
+        out["2d_fiberDir"] = binary_fiber_2d
+        out["t_uv"] = binary_fiber_2d
+    out["3d_fiberDir"] = binary_fiber_3d
+    out["fiber_direction"] = binary_fiber_3d
+    out["fiber3d"] = binary_fiber_3d
+
+    return out
+
+
+class Load_Model:
+    @staticmethod
+    def load(path, decoder_cls=None, device=None):
+        return load_optimized_shell_function(
+            path=path,
+            decoder_cls=decoder_cls,
+            device=device,
+        )
+
+    @staticmethod
+    def evaluate(
+        optimized_function,
+        face_tensors,
+        face_index: int = 0,
+        hard_seed_mask: bool = True,
+    ):
+        return evaluate_optimized_shell_function(
+            optimized_function=optimized_function,
+            face_tensors=face_tensors,
+            face_index=face_index,
+            hard_seed_mask=hard_seed_mask,
+        )
+
+    @staticmethod
+    def visualize(
+        fields,
+        show_2d: bool = True,
+        show_3d: bool = True,
+        **kwargs,
+    ):
+        return visualize_optimized_shell_fields(
+            fields,
+            show_2d=show_2d,
+            show_3d=show_3d,
+            **kwargs,
+        )
+
+    @staticmethod
+    def visualize_2d(fields, **kwargs):
+        return visualize_optimized_shell_fields_2d(fields, **kwargs)
+
+    @staticmethod
+    def visualize_3d(fields, **kwargs):
+        return visualize_optimized_shell_fields_3d(fields, **kwargs)
+
+    @staticmethod
+    def binarize(
+        fields,
+        density_threshold: float = 0.5,
+        solid_density: float = 1.0,
+        void_density: float = 1e-3,
+        mask_void_fibers: bool = True,
+    ):
+        return binarize_optimized_shell_fields(
+            fields,
+            density_threshold=density_threshold,
+            solid_density=solid_density,
+            void_density=void_density,
+            mask_void_fibers=mask_void_fibers,
+        )
 
 class NN_Trainer:
     def __init__(
@@ -699,6 +1478,7 @@ class NN_Trainer:
             power=power,
             eps=eps,
         )
+
 
     @staticmethod
     def ramp_weight(step: int, total_steps: int, start_frac: float, ramp_frac: float) -> float:
@@ -1297,43 +2077,14 @@ class NN_Trainer:
         u_periodic,
         v_periodic,
     ):
-        face_u_periodic = torch.tensor([bool(u_periodic)], dtype=torch.bool, device=device)
-        face_v_periodic = torch.tensor([bool(v_periodic)], dtype=torch.bool, device=device)
-        seed_face_id = torch.zeros(seed_number, dtype=torch.long, device=device)
-
         decoder = self.decoder_cls(
-            n_seeds=seed_number,
-            use_Metric_anisotropy=self.cfg.use_Metric_anisotropy,
-            boundary_solid_idx=boundary_idx_ring1,
-            seed_face_id=seed_face_id,
-            face_u_periodic=face_u_periodic,
-            face_v_periodic=face_v_periodic,
-            w_min=self.cfg.w_min,
-            w_max_ratio=self.cfg.w_max_ratio,
-            beta=self.cfg.beta,
-            density_projection_strength=self.cfg.density_projection_strength,
-            density_projection_threshold=self.cfg.density_projection_threshold,
-            density_projection_gamma=self.cfg.density_projection_gamma,
-            duplicate_merge_sigma=self.cfg.duplicate_merge_sigma,
-            seed_activity_sharpness=self.cfg.seed_activity_sharpness,
-            seed_activity_threshold=self.cfg.seed_activity_threshold,
-            raw_temp=self.cfg.decoder_raw_temp,
-            use_band_weighted_fiber_pairs=self.cfg.use_band_weighted_fiber_pairs,
-            fiber_band_prior_power=self.cfg.fiber_band_prior_power,
-            fiber_band_prior_floor=self.cfg.fiber_band_prior_floor,
-            fixed_height=self.cfg.fixed_height,
-
-            use_boundary_attachment=self.cfg.use_boundary_attachment,
-            boundary_attach_width=self.cfg.boundary_attach_width,
-            boundary_attach_beta=self.cfg.boundary_attach_beta,
-            boundary_attach_alpha=self.cfg.boundary_attach_alpha,
-
-            boundary_attach_width_min=self.cfg.boundary_attach_width_min,
-            boundary_attach_width_max=self.cfg.boundary_attach_width_max,
-            boundary_attach_alpha_min=self.cfg.boundary_attach_alpha_min,
-            boundary_attach_alpha_max=self.cfg.boundary_attach_alpha_max,
-            boundary_attach_beta_min=self.cfg.boundary_attach_beta_min,
-            boundary_attach_beta_max=self.cfg.boundary_attach_beta_max,
+            **self._decoder_init_kwargs(
+                device=device,
+                seed_number=seed_number,
+                boundary_idx_ring1=boundary_idx_ring1,
+                u_periodic=u_periodic,
+                v_periodic=v_periodic,
+            )
         ).to(device)
 
         ppnet = self.ppnet_cls(
@@ -1361,9 +2112,53 @@ class NN_Trainer:
                 and float(self.cfg.allow_seed_outside_domain_warmup_frac) <= 0.0
             ),
             seed_domain_margin=self.cfg.seed_domain_margin,
+            use_independent_seed_offsets=self.cfg.use_independent_seed_offsets,
+            independent_seed_offset_max=self.cfg.independent_seed_offset_max,
         ).to(device)
 
         return decoder, ppnet
+
+    def _decoder_init_kwargs(self, device, seed_number, u_periodic, v_periodic, boundary_idx_ring1=None):
+        face_u_periodic = torch.tensor([bool(u_periodic)], dtype=torch.bool, device=device)
+        face_v_periodic = torch.tensor([bool(v_periodic)], dtype=torch.bool, device=device)
+        seed_face_id = torch.zeros(seed_number, dtype=torch.long, device=device)
+        if boundary_idx_ring1 is None:
+            boundary_solid_idx = torch.empty(0, dtype=torch.long, device=device)
+        else:
+            boundary_solid_idx = torch.as_tensor(boundary_idx_ring1, dtype=torch.long, device=device)
+
+        return {
+            "n_seeds": int(seed_number),
+            "use_Metric_anisotropy": self.cfg.use_Metric_anisotropy,
+            "boundary_solid_idx": boundary_solid_idx,
+            "seed_face_id": seed_face_id,
+            "face_u_periodic": face_u_periodic,
+            "face_v_periodic": face_v_periodic,
+            "w_min": self.cfg.w_min,
+            "w_max_ratio": self.cfg.w_max_ratio,
+            "beta": self.cfg.beta,
+            "density_projection_strength": self.cfg.density_projection_strength,
+            "density_projection_threshold": self.cfg.density_projection_threshold,
+            "density_projection_gamma": self.cfg.density_projection_gamma,
+            "duplicate_merge_sigma": self.cfg.duplicate_merge_sigma,
+            "seed_activity_sharpness": self.cfg.seed_activity_sharpness,
+            "seed_activity_threshold": self.cfg.seed_activity_threshold,
+            "raw_temp": self.cfg.decoder_raw_temp,
+            "use_band_weighted_fiber_pairs": self.cfg.use_band_weighted_fiber_pairs,
+            "fiber_band_prior_power": self.cfg.fiber_band_prior_power,
+            "fiber_band_prior_floor": self.cfg.fiber_band_prior_floor,
+            "fixed_height": self.cfg.fixed_height,
+            "use_boundary_attachment": self.cfg.use_boundary_attachment,
+            "boundary_attach_width": self.cfg.boundary_attach_width,
+            "boundary_attach_beta": self.cfg.boundary_attach_beta,
+            "boundary_attach_alpha": self.cfg.boundary_attach_alpha,
+            "boundary_attach_width_min": self.cfg.boundary_attach_width_min,
+            "boundary_attach_width_max": self.cfg.boundary_attach_width_max,
+            "boundary_attach_alpha_min": self.cfg.boundary_attach_alpha_min,
+            "boundary_attach_alpha_max": self.cfg.boundary_attach_alpha_max,
+            "boundary_attach_beta_min": self.cfg.boundary_attach_beta_min,
+            "boundary_attach_beta_max": self.cfg.boundary_attach_beta_max,
+        }
 
     def _build_face_model(self, face_tensor, device):
         return self._build_single_face_models(
@@ -1373,6 +2168,72 @@ class NN_Trainer:
             u_periodic=face_tensor.get("u_periodic", False),
             v_periodic=face_tensor.get("v_periodic", False),
         )
+
+    def _save_optimized_shell_function(
+        self,
+        save_dir,
+        decoder,
+        ppnet,
+        face_tensor,
+        best_pred,
+        best_score,
+        best_step,
+        returned_best_source,
+        final_shape_density=None,
+        final_shape_fiber_direction=None,
+    ):
+        if save_dir is None:
+            return None
+        if best_pred is None:
+            return None
+
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(save_dir, "optimized_shell_function.pt")
+        device = face_tensor["uv"].device
+
+        package = {
+            "package_type": "OptimizedShellFunction",
+            "package_version": OptimizedShellFunction.package_version,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "config": asdict(self.cfg),
+            "decoder_class": {
+                "module": decoder.__class__.__module__,
+                "name": decoder.__class__.__name__,
+            },
+            "ppnet_class": {
+                "module": ppnet.__class__.__module__,
+                "name": ppnet.__class__.__name__,
+            },
+            "decoder_init_kwargs": _cpu_detached_tree(
+                self._decoder_init_kwargs(
+                    device=device,
+                    seed_number=int(getattr(decoder, "n_seeds", self.cfg.seed_number)),
+                    boundary_idx_ring1=face_tensor.get("boundary_idx_ring1", None),
+                    u_periodic=face_tensor.get("u_periodic", False),
+                    v_periodic=face_tensor.get("v_periodic", False),
+                )
+            ),
+            "decoder_state_dict": _cpu_detached_tree(decoder.state_dict()),
+            "ppnet_state_dict": _cpu_detached_tree(ppnet.state_dict()),
+            "best_pred": _cpu_detached_tree(best_pred),
+            "best_score": float(best_score),
+            "best_step": int(best_step),
+            "returned_best_source": returned_best_source,
+            "face_metadata": {
+                "face_id": _cpu_detached_tree(face_tensor.get("face_id", 0)),
+                "u_periodic": bool(face_tensor.get("u_periodic", False)),
+                "v_periodic": bool(face_tensor.get("v_periodic", False)),
+                "num_surface_points": int(face_tensor["uv"].shape[0]),
+            },
+            "final_shape_density": _cpu_detached_tree(final_shape_density),
+            "final_shape_fiber_direction": _cpu_detached_tree(final_shape_fiber_direction),
+        }
+        torch.save(package, path)
+        return path
+
+    @staticmethod
+    def load_optimized_shell_function(path, decoder_cls=None, device=None):
+        return OptimizedShellFunction.load(path, decoder_cls=decoder_cls, device=device)
 
     def _build_optimizer(self, ppnet, decoder):
         cfg = self.cfg
@@ -1387,6 +2248,15 @@ class NN_Trainer:
             {"params": ppnet.delta_head.parameters(), "lr": cfg.lr_delta_head},
             {"params": [ppnet.global_latent], "lr": cfg.lr_mlp},
         ])
+
+        independent_seed_offsets = getattr(ppnet, "independent_seed_offsets", None)
+        if independent_seed_offsets is not None and independent_seed_offsets.requires_grad:
+            param_groups.append(
+                {
+                    "params": [independent_seed_offsets],
+                    "lr": cfg.lr_independent_seed_offsets,
+                }
+            )
 
         w_head = getattr(ppnet, "w_head", None)
         if w_head is not None:
@@ -1490,6 +2360,13 @@ class NN_Trainer:
                 new_embedding.weight.copy_(old_embedding.weight.index_select(0, active_idx.to(old_embedding.weight.device)))
                 seed_identity.embedding = new_embedding
 
+            independent_seed_offsets = getattr(ppnet, "independent_seed_offsets", None)
+            if independent_seed_offsets is not None:
+                active_idx_offsets = active_idx.to(independent_seed_offsets.device)
+                ppnet.seed_free_offset_raw = torch.nn.Parameter(
+                    independent_seed_offsets.index_select(0, active_idx_offsets).detach().clone()
+                )
+
             decoder.n_seeds = new_count
             decoder.seed_face_id = decoder.seed_face_id.index_select(
                 0,
@@ -1568,7 +2445,6 @@ class NN_Trainer:
 
         return out
     
-    
     def _init_face_seed(self, face_tensor):
         cfg = self.cfg
         boundary = self._true_open_boundary_idx(face_tensor)
@@ -1633,6 +2509,21 @@ class NN_Trainer:
         for k, v in self.last_fem_debug.items():
             print(f"{k}: {v}")
         print("Skipping FEM term for this step.\n")
+
+    def _auto_update_w_min_from_face_scale(self, face_tensor):
+        cfg = self.cfg
+        if not bool(getattr(cfg, "auto_update_wmin", False)):
+            return
+
+        cfg.w_min = compute_w_min_from_min_feature_size_3d(
+            Xu=face_tensor["Xu"],
+            Xv=face_tensor["Xv"],
+            min_feature_size_3d=float(cfg.min_feature_size_3d),
+        )
+        tqdm.write(
+            "Auto-updated w_min from min_feature_size_3d="
+            f"{float(cfg.min_feature_size_3d):.6g}: w_min={float(cfg.w_min):.6g}"
+        )
 
     # ------------------------------------------------------------------
     # Training
@@ -3514,6 +4405,7 @@ class NN_Trainer:
   
     def train(self, shape_path, face_tensors):
         cfg = self.cfg
+        # time.perf_counter() returns the value (in fractional seconds) of a performance counter, i.e., a clock with the highest available resolution to measure a short duration.
         train_start_time = time.perf_counter()
 
         # Always train one face. If multiple faces are provided, use cfg.training_face_index.
@@ -3522,6 +4414,7 @@ class NN_Trainer:
 
         # validate the selected face tensor before training
         self._validate_face_tensors(face_tensors)
+        self._auto_update_w_min_from_face_scale(face_tensor)
 
         # Assign device and data type used during training process
         ref_uv = face_tensor["uv"]
@@ -3795,6 +4688,7 @@ class NN_Trainer:
                     pred_i = ppnet(uv_anchor_i, offset_scale=seed_offset_scale_step)
 
                     seeds_raw_i = pred_i["seeds_raw"]
+                    # repulse seed by itersionally projecting them to be more evenly spaced, which can help improve the stability and convergence of the training process.
                     if cfg.project_seed_spacing_each_step:
                         seeds_raw_i = self.project_seed_spacing(
                             seeds_list=[seeds_raw_i],
@@ -4991,6 +5885,32 @@ class NN_Trainer:
             except Exception as e:
                 tqdm.write(f"Failed to build timelapse video: {e}")
 
+        optimized_function_path = None
+        optimized_function_dir = timelapse_output_folder
+        if optimized_function_dir is None:
+            cfg_output_folder = getattr(cfg, "timelapse_output_folder", None)
+            if cfg_output_folder:
+                optimized_function_dir = os.path.normpath(str(cfg_output_folder))
+
+        if optimized_function_dir is not None:
+            try:
+                optimized_function_path = self._save_optimized_shell_function(
+                    save_dir=optimized_function_dir,
+                    decoder=decoder,
+                    ppnet=ppnet,
+                    face_tensor=face_tensor,
+                    best_pred=best_pred[0] if best_pred else None,
+                    best_score=best_score,
+                    best_step=best_step,
+                    returned_best_source=returned_best_source,
+                    final_shape_density=final_shape_density,
+                    final_shape_fiber_direction=final_shape_fiber_direction,
+                )
+                if optimized_function_path is not None:
+                    tqdm.write(f"Saved optimized shell function: {optimized_function_path}")
+            except Exception as e:
+                tqdm.write(f"Failed to save optimized shell function: {e}")
+
         return {
             "decoders": decoders,
             "ppnets": ppnets,
@@ -5024,4 +5944,5 @@ class NN_Trainer:
             "last_fem_debug": self.last_fem_debug,
             "tensorboard_log_dir": self.tensorboard_log_dir,
             "shape_path": shape_path,
+            "optimized_function_path": optimized_function_path,
         }

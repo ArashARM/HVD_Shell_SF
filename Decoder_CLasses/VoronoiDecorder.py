@@ -902,21 +902,46 @@ class VoronoiDecoder(nn.Module):
         seeds: torch.Tensor,
         seed_face_id: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        pair_weights = torch.nan_to_num(pair_weights, nan=0.0, posinf=0.0, neginf=0.0)
         t_ij = self._pairwise_uv_dirs(seeds, seed_face_id=seed_face_id)               # (S,S,2)
+        t_ij = torch.nan_to_num(t_ij, nan=0.0, posinf=0.0, neginf=0.0)
         Q_ij = t_ij.unsqueeze(-1) * t_ij.unsqueeze(-2)     # (S,S,2,2)
         return (pair_weights.unsqueeze(-1).unsqueeze(-1) * Q_ij.unsqueeze(0)).sum(dim=(1, 2))
 
     def _principal_axial_direction(self, Q: torch.Tensor) -> torch.Tensor:
-        evals, evecs = torch.linalg.eigh(Q)                # (N,2), (N,2,2)
-        t_uv = evecs[..., -1]                              # principal eigenvector
-        t_uv = t_uv / torch.norm(t_uv, dim=-1, keepdim=True).clamp_min(self.eps)
-        has_orientation = evals.sum(dim=-1, keepdim=True) > self.eps
+        Q = torch.nan_to_num(Q, nan=0.0, posinf=0.0, neginf=0.0)
+        Q = 0.5 * (Q + Q.transpose(-1, -2))
+
+        q00 = Q[..., 0, 0]
+        q01 = Q[..., 0, 1]
+        q11 = Q[..., 1, 1]
+        trace = q00 + q11
+        diff = q00 - q11
+        gap = torch.sqrt(diff * diff + 4.0 * q01 * q01)
+        lambda_max = 0.5 * (trace + gap)
+
+        v1 = torch.stack([q01, lambda_max - q00], dim=-1)
+        v2 = torch.stack([lambda_max - q11, q01], dim=-1)
+        use_v1 = torch.norm(v1, dim=-1, keepdim=True) >= torch.norm(v2, dim=-1, keepdim=True)
+        t_uv = torch.where(use_v1, v1, v2)
+
+        # Isotropic/zero tensors do not have a meaningful principal direction.
+        fallback = torch.zeros_like(t_uv)
+        fallback[..., 0] = 1.0
+        t_norm = torch.norm(t_uv, dim=-1, keepdim=True)
+        t_uv = torch.where(t_norm > self.eps, t_uv / t_norm.clamp_min(self.eps), fallback)
+        has_orientation = trace.reshape(*trace.shape, 1) > self.eps
         return torch.where(has_orientation, t_uv, torch.zeros_like(t_uv))
 
     def _axial_coherence_from_tensor(self, Q: torch.Tensor) -> torch.Tensor:
-        evals = torch.linalg.eigvalsh(Q)
-        gap = (evals[..., -1] - evals[..., 0]).clamp_min(0.0)
-        trace = evals.sum(dim=-1).clamp_min(self.eps)
+        Q = torch.nan_to_num(Q, nan=0.0, posinf=0.0, neginf=0.0)
+        Q = 0.5 * (Q + Q.transpose(-1, -2))
+        q00 = Q[..., 0, 0]
+        q01 = Q[..., 0, 1]
+        q11 = Q[..., 1, 1]
+        trace = (q00 + q11).clamp_min(self.eps)
+        diff = q00 - q11
+        gap = torch.sqrt(diff * diff + 4.0 * q01 * q01).clamp_min(0.0)
         return (gap / trace).clamp(0.0, 1.0)
 
     def _blended_uv_fiber_axial(

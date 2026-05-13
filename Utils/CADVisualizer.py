@@ -458,6 +458,7 @@ class CADVisualizer:
                 tubes.save(export_stl)
                 print("Saved STL to:", export_stl)
 
+        pl.show_axes()
         pl.show()
         return solid, float(thr), pl
     
