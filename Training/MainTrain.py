@@ -1,5 +1,7 @@
 from dataclasses import asdict, dataclass
+import csv
 import importlib
+import json
 import math
 import os
 import shutil
@@ -1292,6 +1294,10 @@ class NN_Trainer:
 
         self._tb_add_scalar("Physics/ComplianceRaw", row["comp"], step)
         self._tb_add_scalar("Physics/VolumeFraction", row["vol_frac"], step)
+        self._tb_add_scalar("Physics/VF_total", row["VF_total"], step)
+        self._tb_add_scalar("Physics/VF_eff_total", row["VF_eff_total"], step)
+        self._tb_add_scalar("Physics/VF_int", row["VF_int"], step)
+        self._tb_add_scalar("Physics/VF_eff_int", row["VF_eff_int"], step)
         self._tb_add_scalar("Physics/VolumeFractionEffective", row["vol_frac_eff"], step)
         self._tb_add_scalar("Physics/VolumeFractionSharp", row["vol_frac_sharp"], step)
         self._tb_add_scalar("Physics/VolumeDeviation", row["vol_dev"], step)
@@ -1328,9 +1334,11 @@ class NN_Trainer:
         self._tb_add_scalar("Train/Tau", row["tau"], step)
 
         self._tb_add_scalar("seed_activation/active_count_total", row["active_count_total"], step)
+        self._tb_add_scalar("seed_activation/visible_active_count_total", row["visible_active_count_total"], step)
         self._tb_add_scalar("seed_activation/active_count_mean", row["active_count_mean"], step)
         self._tb_add_scalar("seed_activation/active_frac_mean", row["active_frac_mean"], step)
         self._tb_add_scalar("seed_activation/inactive_count_total", row["inactive_count_total"], step)
+        self._tb_add_scalar("seed_activation/visible_inactive_count_total", row["visible_inactive_count_total"], step)
         self._tb_add_scalar("seed_activation/inactive_count_mean", row["inactive_count_mean"], step)
         self._tb_add_scalar("seed_activation/inactive_frac_mean", row["inactive_frac_mean"], step)
         self._tb_add_scalar("seed_activation/weight_min", row["seed_active_weight_min"], step)
@@ -1404,7 +1412,11 @@ class NN_Trainer:
                 if p.get("seed_active_weights") is not None:
                     seed_active_weight_vals.append(p["seed_active_weights"].reshape(-1))
                 if p.get("tau") is not None:
-                    tau_vals.append(p["tau"].reshape(-1))
+                    tau_value = p["tau"]
+                    if isinstance(tau_value, torch.Tensor):
+                        tau_vals.append(tau_value.reshape(-1))
+                    else:
+                        tau_vals.append(torch.as_tensor([float(tau_value)]))
 
             if seed_active_weight_vals:
                 self._tb_add_histogram("seed_activation/weights", torch.cat(seed_active_weight_vals, dim=0), step)
@@ -1633,6 +1645,79 @@ class NN_Trainer:
             return f"{hours:d} h {minutes:02d} min {secs:02d} sec"
         return f"{minutes:d} min {secs:02d} sec"
 
+    @staticmethod
+    def _volume_metric_definitions() -> dict[str, str]:
+        return {
+            "VF_total": "Total volume fraction. Area-weighted mean density of the full shell field, including boundary attachment.",
+            "VF_eff_total": "Efficient total volume fraction. Area-weighted mean of the powered full shell density; lower density material contributes less.",
+            "VF_int": "Interior (Voronoi edges only) volume fraction. Area-weighted mean density of the interior Voronoi-edge field without boundary attachment.",
+            "VF_eff_int": "Efficient Interior (Voronoi edges only) volume fraction. Area-weighted mean of the powered interior Voronoi-edge density.",
+        }
+
+    def _save_optimization_logs(
+        self,
+        output_folder: str | None,
+        history: list[dict],
+        best_row: dict | None,
+        best_score: float,
+        best_step: int,
+        computation_time_sec: float,
+        returned_best_source: str,
+    ) -> str | None:
+        if not output_folder:
+            return None
+
+        log_dir = os.path.join(os.path.normpath(str(output_folder)), "OptimizationLogs")
+        os.makedirs(log_dir, exist_ok=True)
+
+        config_path = os.path.join(log_dir, "training_parameters.txt")
+        with open(config_path, "w", encoding="utf-8") as f:
+            f.write("Training Parameters\n")
+            f.write("===================\n")
+            for key, value in sorted(asdict(self.cfg).items()):
+                f.write(f"{key}: {value}\n")
+
+        definitions_path = os.path.join(log_dir, "volume_metric_definitions.txt")
+        with open(definitions_path, "w", encoding="utf-8") as f:
+            f.write("Volume Metric Definitions\n")
+            f.write("=========================\n")
+            f.write("Legacy names in older logs:\n")
+            f.write("Tot_VolFrac = VF_total\n")
+            f.write("HVD_OFRAC / HVD_VolFrac = VF_int\n")
+            f.write("EFF_volfrac / Eff_VolFrac = VF_eff_int\n\n")
+            for key, description in self._volume_metric_definitions().items():
+                f.write(f"{key}: {description}\n")
+
+        summary = {
+            "best_score": best_score,
+            "best_step": best_step,
+            "returned_best_source": returned_best_source,
+            "computation_time": self._format_elapsed_time(computation_time_sec),
+            "computation_time_seconds": computation_time_sec,
+            "volume_metrics": self._volume_metric_definitions(),
+            "best_row": best_row or {},
+        }
+        summary_path = os.path.join(log_dir, "optimization_summary.json")
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, sort_keys=True)
+
+        history_path = os.path.join(log_dir, "optimization_history.csv")
+        if history:
+            fieldnames = []
+            for row in history:
+                for key in row.keys():
+                    if key not in fieldnames:
+                        fieldnames.append(key)
+            with open(history_path, "w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(history)
+        else:
+            with open(history_path, "w", encoding="utf-8", newline="") as f:
+                f.write("")
+
+        return log_dir
+
     def _timelapse_geometry_summary(self, face_tensors) -> str:
 
 
@@ -1691,6 +1776,13 @@ class NN_Trainer:
 
     @staticmethod
     def _clone_pred_list(pred_list: list[dict]) -> list[dict]:
+        def _clone_value(value):
+            if value is None:
+                return None
+            if isinstance(value, torch.Tensor):
+                return value.detach().clone()
+            return value
+
         return [
             {
                 "face_id": p["face_id"],
@@ -1702,7 +1794,7 @@ class NN_Trainer:
                 "inactive_seed_indices": p["inactive_seed_indices"].detach().clone(),
                 "theta": None if p["theta"] is None else p["theta"].detach().clone(),
                 "a_raw": None if p["a_raw"] is None else p["a_raw"].detach().clone(),
-                "tau": None if p.get("tau") is None else p["tau"].detach().clone(),
+                "tau": _clone_value(p.get("tau")),
                 "boundary_width_raw": None if p["boundary_width_raw"] is None else p["boundary_width_raw"].detach().clone(),
                 "boundary_alpha_raw": None if p["boundary_alpha_raw"] is None else p["boundary_alpha_raw"].detach().clone(),
                 "boundary_beta_raw": None if p["boundary_beta_raw"] is None else p["boundary_beta_raw"].detach().clone(),
@@ -3412,6 +3504,10 @@ class NN_Trainer:
             active = active_values.detach().cpu().numpy().reshape(-1).astype(bool)
         else:
             active = np.ones((seeds.shape[0],), dtype=bool)
+        weight_values = pred_i.get("seed_active_weights", None)
+        if weight_values is not None:
+            weights = weight_values.detach().cpu().numpy().reshape(-1)
+            active = active & (weights >= 0.5)
 
         if seeds.shape[0] > 0:
             if np.any(~active):
@@ -3484,7 +3580,7 @@ class NN_Trainer:
                 if active_weights_i is not None
                 else active_mask.astype(float)
             )
-            participating_mask = active_mask
+            participating_mask = active_mask & (weights >= 0.5)
             inactive_mask = ~participating_mask
 
             xyz_i_active = xyz_i[participating_mask]
@@ -4657,6 +4753,8 @@ class NN_Trainer:
                 participating_frac_sum = 0.0
                 inactive_count_total = 0.0
                 inactive_frac_sum = 0.0
+                visible_active_count_total = 0.0
+                visible_inactive_count_total = 0.0
                 active_weight_min_list = []
                 active_weight_mean_sum = 0.0
                 active_weight_max_list = []
@@ -4788,11 +4886,16 @@ class NN_Trainer:
                     inactive_seed_indices_i = decoder_out["inactive_seed_indices"]
                     active_count_i = float(seed_active_mask_i.detach().to(torch.float32).sum().item())
                     inactive_count_i = float((~seed_active_mask_i.detach()).to(torch.float32).sum().item())
+                    visible_active_mask_i = seed_active_mask_i & (seed_active_weights_i >= 0.5)
+                    visible_active_count_i = float(visible_active_mask_i.detach().to(torch.float32).sum().item())
+                    visible_inactive_count_i = float((~visible_active_mask_i.detach()).to(torch.float32).sum().item())
                     total_seed_i = max(int(seed_active_mask_i.numel()), 1)
                     participating_count_total += active_count_i
                     participating_frac_sum += active_count_i / float(total_seed_i)
                     inactive_count_total += inactive_count_i
                     inactive_frac_sum += inactive_count_i / float(total_seed_i)
+                    visible_active_count_total += visible_active_count_i
+                    visible_inactive_count_total += visible_inactive_count_i
                     active_weight_min_list.append(float(seed_active_weights_i.detach().min().item()))
                     active_weight_mean_sum += float(seed_active_weights_i.detach().mean().item())
                     active_weight_max_list.append(float(seed_active_weights_i.detach().max().item()))
@@ -4883,7 +4986,7 @@ class NN_Trainer:
                         "inactive_seed_indices": inactive_seed_indices_i.detach().clone(),
                         "theta": None if theta_i is None else theta_i.detach().clone(),
                         "a_raw": None if a_raw_i is None else a_raw_i.detach().clone(),
-                        "tau": None if tau_pred_i is None else tau_pred_i.detach().clone(),
+                        "tau": tau_step.detach().clone() if isinstance(tau_step, torch.Tensor) else float(tau_step),
 
                         "boundary_width": boundary_width_i.detach().clone() if isinstance(boundary_width_i, torch.Tensor) else boundary_width_i,
                         "boundary_alpha": boundary_alpha_i.detach().clone() if isinstance(boundary_alpha_i, torch.Tensor) else boundary_alpha_i,
@@ -5013,7 +5116,18 @@ class NN_Trainer:
                 # ----------------------------------------------------
                 vol_frac_total = (rho * A_v).sum() / (A_v.sum() + cfg.eps)
                 vol_frac_v = (rho_v_all * A_v).sum() / (A_v.sum() + cfg.eps)
-                vol_frac_eff = vol_frac_v
+                vol_frac_eff_total = self.loss_volume.powered_fraction(
+                    rho=rho,
+                    A_v=A_v,
+                    power=cfg.effective_volume_power,
+                    eps=cfg.eps,
+                )
+                vol_frac_eff = self.loss_volume.powered_fraction(
+                    rho=rho_v_all,
+                    A_v=A_v,
+                    power=cfg.effective_volume_power,
+                    eps=cfg.eps,
+                )
                 sharp_vol_ramp = 0.0
                 loss_vol_sharp = zero
                 loss_vol = zero
@@ -5308,7 +5422,10 @@ class NN_Trainer:
                                 f"New best_step={best_step} | "
                                 f"best_score={best_score:.6f} | "
                                 f"best_active_count={best_active_count:.1f} | "
-                                f"vol_eff={best_vol_frac:.6f} | "
+                                f"VF_total={float(vol_frac.detach().item()):.6f} | "
+                                f"VF_eff_total={float(vol_frac_eff_total.detach().item()):.6f} | "
+                                f"VF_int={float(vol_frac_v.detach().item()):.6f} | "
+                                f"VF_eff_int={best_vol_frac:.6f} | "
                                 f"comp={best_comp:.6e} | "
                                 f"w={best_w_geo:.6e}"
                             )
@@ -5358,7 +5475,12 @@ class NN_Trainer:
                         "comp": self._finite_or_default(comp_val),
                         "vol_frac": float(vol_frac.detach().item()),
                         "vol_frac_internal": float(vol_frac_v.detach().item()),
+                        "vol_frac_eff_total": float(vol_frac_eff_total.detach().item()),
                         "vol_frac_eff": float(vol_frac_eff.detach().item()),
+                        "VF_total": float(vol_frac.detach().item()),
+                        "VF_eff_total": float(vol_frac_eff_total.detach().item()),
+                        "VF_int": float(vol_frac_v.detach().item()),
+                        "VF_eff_int": float(vol_frac_eff.detach().item()),
                         "vol_frac_sharp": float(vol_frac_sharp.detach().item()),
                         "vol_dev": float(vol_dev.detach().item()),
                         "vol_dev_eff": float(vol_dev_eff.detach().item()),
@@ -5403,6 +5525,8 @@ class NN_Trainer:
                         "inactive_count_total": inactive_count_total,
                         "inactive_count_mean": inactive_count_mean,
                         "inactive_frac_mean": inactive_frac_mean,
+                        "visible_active_count_total": visible_active_count_total,
+                        "visible_inactive_count_total": visible_inactive_count_total,
                         "seed_active_weight_min": active_weight_min_global,
                         "seed_active_weight_mean": active_weight_mean_global,
                         "seed_active_weight_max": active_weight_max_global,
@@ -5456,15 +5580,16 @@ class NN_Trainer:
                             cad_img=cad_img,
                             loss_dict=loss_dict,
                             title_text=(
-                                f"vol_total={row['vol_frac']:.4f} | "
-                                f"vol_internal={row['vol_frac_internal']:.4f} | "
-                                f"vol_eff={row['vol_frac_eff']:.4f} | "
+                                f"VF_total={row['VF_total']:.4f} | "
+                                f"VF_eff_total={row['VF_eff_total']:.4f} | "
+                                f"VF_int={row['VF_int']:.4f} | "
+                                f"VF_eff_int={row['VF_eff_int']:.4f} | "
                                 f"W={row['w_geo_mean']:.4g} | "
                                 f"tau={row['tau']:.4g} | "
                                 f"bw={row['boundary_width_mean']:.4g} | "
                                 f"ba={row['boundary_alpha_mean']:.4g} | "
                                 f"bb={row['boundary_beta_mean']:.4g} | "
-                                f"act={row['active_count_total']:.0f} inact={row['inactive_count_total']:.0f} | "
+                                f"act={row['visible_active_count_total']:.0f} inact={row['visible_inactive_count_total']:.0f} | "
                                 f"Δrho={drho:.2e} Δseed={dseed:.2e} "
                                 f"dmin={min_seed_dist:.2e} grad_mean={g_mean:.2e} | "
                             ),
@@ -5497,8 +5622,10 @@ class NN_Trainer:
                             f"L_strut={row['loss_strut']:.3e} "
                             f"L_rep={row['loss_rep']:.3e} "
                             f"L_bnd={row['loss_bnd']:.3e} |"
-                            f"vol={row['vol_frac']:.3f} "
-                            f"vol_eff={row['vol_frac_eff']:.3f} "
+                            f"VF_total={row['VF_total']:.3f} "
+                            f"VF_eff_total={row['VF_eff_total']:.3f} "
+                            f"VF_int={row['VF_int']:.3f} "
+                            f"VF_eff_int={row['VF_eff_int']:.3f} "
                             f"(/{cfg.target_volfrac:.3f}) "
                             f"tau={row['tau']:.3e} "
                             f"os={row['seed_offset_scale']:.2e} "
@@ -5746,7 +5873,8 @@ class NN_Trainer:
 
         tqdm.write(
             f"FINAL RETURNED: best_step={best_step}, best_score={best_score:.6f} | "
-            f"vol_eff={best_vol_frac:.3e}, comp={best_comp:.3e}, w_geo={best_w_geo:.3e} | "
+            f"VF_eff_int={best_vol_frac:.3e}, "
+            f"comp={best_comp:.3e}, w_geo={best_w_geo:.3e} | "
             f"active={float(best_active_count or 0.0):.0f}, inactive={float(best_inactive_count or 0.0):.0f} | "
             f"source={returned_best_source} | "
             f"time={self._format_elapsed_time(computation_time_sec)}"
@@ -5763,6 +5891,31 @@ class NN_Trainer:
                 if int(row["step"]) == int(best_step):
                     best_row = row
                     break
+
+        if best_row is not None:
+            tqdm.write(
+                "BEST VOLUME METRICS: "
+                f"VF_total={best_row['VF_total']:.6g} | "
+                f"VF_eff_total={best_row['VF_eff_total']:.6g} | "
+                f"VF_int={best_row['VF_int']:.6g} | "
+                f"VF_eff_int={best_row['VF_eff_int']:.6g}"
+            )
+
+        optimization_log_dir = None
+        try:
+            optimization_log_dir = self._save_optimization_logs(
+                output_folder=timelapse_output_folder or getattr(cfg, "timelapse_output_folder", None),
+                history=history,
+                best_row=best_row,
+                best_score=best_score,
+                best_step=best_step,
+                computation_time_sec=computation_time_sec,
+                returned_best_source=returned_best_source,
+            )
+            if optimization_log_dir is not None:
+                tqdm.write(f"Saved optimization logs: {optimization_log_dir}")
+        except Exception as e:
+            tqdm.write(f"Failed to save optimization logs: {e}")
 
         if cfg.MakeTimelaps:
             try:
@@ -5783,12 +5936,14 @@ class NN_Trainer:
                     else float(best_vol_frac)
                 )
                 best_vol_eff = float(best_vol_frac)
+                best_vol_eff_total = (
+                    float(best_row["VF_eff_total"])
+                    if best_row is not None and "VF_eff_total" in best_row
+                    else float("nan")
+                )
                 tuned_param_summary = {
                     "best_step": f"{int(best_step)}",
                     "active_seeds": f"{active_seed_count}/{total_seed_slots}",
-                    "Vol_total": f"{best_vol_total:.6g}",
-                    "Vol_internal": f"{best_vol_internal:.6g}",
-                    "Vol_eff": f"{best_vol_eff:.6g}",
                     "w": f"{float(best_w_geo):.6g}",
                     "tau": f"{self._fallback_tau_value():.6g}",
                     "h": "nan",
@@ -5842,9 +5997,10 @@ class NN_Trainer:
                     "L_Rep": float(best_row["loss_rep"]) if best_row is not None else float("nan"),
                 }
                 results_text = (
-                    f"vol_total={best_vol_total:.6g} | "
-                    f"vol_internal={best_vol_internal:.6g} | "
-                    f"vol_eff={best_vol_eff:.6g} | "
+                    f"VF_total={best_vol_total:.6g} | "
+                    f"VF_eff_total={best_vol_eff_total:.6g} | "
+                    f"VF_int={best_vol_internal:.6g} | "
+                    f"VF_eff_int={best_vol_eff:.6g} | "
                     f"fem={float(best_comp):.6g} | "
                     f"compute_time={self._format_elapsed_time(computation_time_sec)}"
                 )
@@ -5944,6 +6100,7 @@ class NN_Trainer:
             "fem_debug_history": self.fem_debug_history,
             "last_fem_debug": self.last_fem_debug,
             "tensorboard_log_dir": self.tensorboard_log_dir,
+            "optimization_log_dir": optimization_log_dir,
             "shape_path": shape_path,
             "optimized_function_path": optimized_function_path,
         }

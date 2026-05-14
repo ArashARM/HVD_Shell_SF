@@ -100,12 +100,20 @@ class TimelapseRecorder:
         label_map = {
             "iter": "Iteration",
             "vol": "Vol. Fraction",
-            "vol_total": "Tot_VolFrac",
-            "vol_internal": "HVD_VolFrac",
-            "vol_eff": "Eff_VolFrac",
-            "Vol_total": "Tot_VolFrac",
-            "Vol_internal": "HVD_VolFrac",
-            "Vol_eff": "Eff_VolFrac",
+            "vol_total": "VF_total",
+            "vol_internal": "VF_int",
+            "vol_eff": "VF_eff_int",
+            "total_volume_fraction": "VF_total",
+            "efficient_total_volume_fraction": "VF_eff_total",
+            "interior_voronoi_edges_only_volume_fraction": "VF_int",
+            "efficient_interior_voronoi_edges_only_volume_fraction": "VF_eff_int",
+            "Vol_total": "VF_total",
+            "Vol_internal": "VF_int",
+            "Vol_eff": "VF_eff_int",
+            "VF_total": "VF_total",
+            "VF_eff_total": "VF_eff_total",
+            "VF_int": "VF_int",
+            "VF_eff_int": "VF_eff_int",
             "W": "Mean Width",
             "bw": "Bw",
             "compute_time": "Com. Time",
@@ -349,31 +357,60 @@ class TimelapseRecorder:
                 col_idx = idx // n_rows
                 row_idx = idx % n_rows
                 left_x = card_x + 0.04 + col_idx * 0.46
-                right_x = left_x + (0.20 if highlight_best else 0.18)
+                label = self._format_metric_label(key)
+                long_label = len(label) > 32
+                right_x = left_x + (
+                    0.36 if long_label else (0.20 if highlight_best else 0.18)
+                )
                 y = start_y - row_idx * row_step
-                ax_text.text(
-                    left_x,
-                    y,
-                    self._format_metric_label(key),
-                    fontsize=12 if highlight_best else 11,
-                    weight="bold" if highlight_best else "semibold",
-                    va="center",
-                    ha="left",
-                    color="#374151",
-                    transform=ax_text.transAxes,
-                )
-                ax_text.text(
-                    right_x,
-                    y,
-                    value,
-                    fontsize=12 if highlight_best else 11,
-                    va="center",
-                    ha="left",
-                    color="#111827",
-                    weight="bold" if highlight_best else "normal",
-                    family="monospace",
-                    transform=ax_text.transAxes,
-                )
+                if long_label:
+                    ax_text.text(
+                        left_x,
+                        y + 0.022,
+                        label,
+                        fontsize=7.4,
+                        weight="bold" if highlight_best else "semibold",
+                        va="center",
+                        ha="left",
+                        color="#374151",
+                        transform=ax_text.transAxes,
+                    )
+                    ax_text.text(
+                        left_x,
+                        y - 0.024,
+                        value,
+                        fontsize=11 if highlight_best else 10,
+                        va="center",
+                        ha="left",
+                        color="#111827",
+                        weight="bold" if highlight_best else "normal",
+                        family="monospace",
+                        transform=ax_text.transAxes,
+                    )
+                else:
+                    ax_text.text(
+                        left_x,
+                        y,
+                        label,
+                        fontsize=12 if highlight_best else 11,
+                        weight="bold" if highlight_best else "semibold",
+                        va="center",
+                        ha="left",
+                        color="#374151",
+                        transform=ax_text.transAxes,
+                    )
+                    ax_text.text(
+                        right_x,
+                        y,
+                        value,
+                        fontsize=12 if highlight_best else 11,
+                        va="center",
+                        ha="left",
+                        color="#111827",
+                        weight="bold" if highlight_best else "normal",
+                        family="monospace",
+                        transform=ax_text.transAxes,
+                    )
 
                 if row_idx != n_rows - 1 and idx + 1 < len(rows):
                     ax_text.plot(
@@ -424,7 +461,7 @@ class TimelapseRecorder:
             loss_dict=loss_dict,
             title_text=summary_text,
             height=h_left,
-            width=max(780, int(0.34 * w_left)),
+            width=max(980, int(0.42 * w_left)),
             highlight_best=highlight_best,
             chart_title=chart_title,
             summary_title=summary_title,
