@@ -993,12 +993,13 @@ def visualize_optimized_shell_fields_2d(fields, **kwargs):
 
 
 def visualize_optimized_shell_fields_3d(fields, **kwargs):
-    return visualize_optimized_shell_fields(
+    result = visualize_optimized_shell_fields(
         fields,
         show_2d=False,
         show_3d=True,
         **kwargs,
-    )["plotter"]
+    )
+    return result["plotter"], result["density_volume_fraction"]
 
 
 def binarize_optimized_shell_fields(
