@@ -32,6 +32,8 @@ class ThickenShell(problemBase):
         load_dir=None,
         load_surface_dir=None,
         load_surface_side="max",
+        fixed_side="min",
+        force_side=None,
     ):
         super().__init__()
         self.name = self.problemName
@@ -49,6 +51,8 @@ class ThickenShell(problemBase):
         self.load_dir = None if load_dir is None else str(load_dir).lower()
         self.load_surface_dir = None if load_surface_dir is None else str(load_surface_dir).lower()
         self.load_surface_side = str(load_surface_side).lower()
+        self.fixed_side = str(fixed_side).lower()
+        self.force_side = None if force_side is None else str(force_side).lower()
 
         self.grid_geom = None
         self.elem_centers = None
@@ -141,9 +145,13 @@ class ThickenShell(problemBase):
             self.apply_three_point_bending_boundary_conditions()
             return
 
+        if self.load_case in ("torsion", "twist", "torque"):
+            self.apply_torsion_boundary_conditions()
+            return
+
         raise ValueError(
             f"Unsupported load_case: {self.load_case}. "
-            "Currently supported: tensile_compression, three_point_bending"
+            "Currently supported: tensile_compression, three_point_bending, torsion"
         )
 
     def _axis_bounds_keys(self, axis):
@@ -253,6 +261,15 @@ class ThickenShell(problemBase):
         nearest = np.argmin(np.abs(values - target))
         return shell_nodes[[nearest]]
 
+    @staticmethod
+    def _opposite_side(side):
+        side = str(side).lower()
+        if side == "min":
+            return "max"
+        if side == "max":
+            return "min"
+        raise ValueError(f"Unsupported side: {side}. Expected 'min' or 'max'.")
+
     def apply_tensile_compression_boundary_conditions(self):
         tol = 0.5* self.voxel_size
         shell_nodes = self.occupied_node_ids()
@@ -311,6 +328,37 @@ class ThickenShell(problemBase):
             force_nodes=force_nodes,
             force_direction=load_dir,
             force_value=self.Load_magnitude,
+        )
+
+    def apply_torsion_boundary_conditions(self):
+        self._axis_bounds_keys(self.BC_dir)
+        fixed_side = self.fixed_side
+        force_side = self.force_side if self.force_side is not None else self._opposite_side(fixed_side)
+        if force_side == fixed_side:
+            raise ValueError("force_side must be opposite to fixed_side for load_case='torsion'")
+
+        tol = 0.5 * self.voxel_size
+        shell_nodes = self.occupied_node_ids()
+
+        fixed_nodes = self.select_shell_axis_slab_nodes(shell_nodes, self.BC_dir, fixed_side, tol)
+        torque_nodes = self.select_shell_axis_slab_nodes(shell_nodes, self.BC_dir, force_side, tol)
+
+        if fixed_nodes.size == 0:
+            raise ValueError(
+                f"No fixed shell nodes selected for load_case={self.load_case}, "
+                f"BC_dir={self.BC_dir}, fixed_side={fixed_side}"
+            )
+        if torque_nodes.size == 0:
+            raise ValueError(
+                f"No torque shell nodes selected for load_case={self.load_case}, "
+                f"BC_dir={self.BC_dir}, force_side={force_side}"
+            )
+
+        self.set_torsion_boundary_conditions(
+            fixed_nodes=fixed_nodes,
+            torque_nodes=torque_nodes,
+            torque_axis=self.BC_dir,
+            total_torque=self.Load_magnitude,
         )
 
     def shellSettings(self):
@@ -908,12 +956,65 @@ class ThickenShell(problemBase):
         dofs = 3 * node_ids + c
         force[dofs, 0] += val_per_node
         return force
+
+    def apply_nodal_torque(self, force, node_ids, axis, total_torque):
+        node_ids = np.asarray(node_ids, dtype=np.int64).reshape(-1)
+        if node_ids.size == 0:
+            raise ValueError("No nodes selected for torque application")
+
+        axis_map = {
+            "x": np.array([1.0, 0.0, 0.0], dtype=float),
+            "y": np.array([0.0, 1.0, 0.0], dtype=float),
+            "z": np.array([0.0, 0.0, 1.0], dtype=float),
+        }
+        axis = str(axis).lower()
+        if axis not in axis_map:
+            raise ValueError(f"Unsupported torque axis: {axis}")
+
+        _all_node_ids, coords = self.get_flat_node_coords()
+        pts = coords[node_ids].astype(float, copy=False)
+        axis_vec = axis_map[axis]
+
+        center = pts.mean(axis=0)
+        r = pts - center[None, :]
+        r -= np.outer(r @ axis_vec, axis_vec)
+
+        tangent = np.cross(axis_vec[None, :], r)
+        radius_sq = np.sum(r * r, axis=1)
+        denom = float(np.sum(radius_sq))
+        if denom <= 1e-20:
+            raise ValueError(
+                f"Cannot apply torsion around axis={axis}: selected torque nodes have near-zero radius"
+            )
+
+        nodal_forces = (float(total_torque) / denom) * tangent
+        for comp in range(3):
+            dofs = 3 * node_ids + comp
+            force[dofs, 0] += nodal_forces[:, comp]
+
+        return force
+
     def set_boundary_conditions_from_regions(self, fixed_nodes, force_nodes, force_direction='z', force_value=-1.0):
         ndof = 3 * (self.mesh['nelx'] + 1) * (self.mesh['nely'] + 1) * (self.mesh['nelz'] + 1)
         force = np.zeros((ndof, 1), dtype=float)
 
         fixed = self.node_ids_to_dofs(fixed_nodes, components=(0, 1, 2))
         force = self.apply_nodal_force(force, force_nodes, force_direction, force_value)
+
+        self.boundaryCondition = {
+            'exampleName': self.name,
+            'physics': 'Structural',
+            'force': force,
+            'fixed': fixed,
+            'numDOFPerNode': 3
+        }
+
+    def set_torsion_boundary_conditions(self, fixed_nodes, torque_nodes, torque_axis='z', total_torque=1.0):
+        ndof = 3 * (self.mesh['nelx'] + 1) * (self.mesh['nely'] + 1) * (self.mesh['nelz'] + 1)
+        force = np.zeros((ndof, 1), dtype=float)
+
+        fixed = self.node_ids_to_dofs(fixed_nodes, components=(0, 1, 2))
+        force = self.apply_nodal_torque(force, torque_nodes, torque_axis, total_torque)
 
         self.boundaryCondition = {
             'exampleName': self.name,
@@ -1236,15 +1337,19 @@ class ThickenShell(problemBase):
             density[valid_filled_ids] = core_density[source_core_elem_idx[valid_filled_ids]]
             fiber[valid_filled_ids] = core_fiber[source_core_elem_idx[valid_filled_ids]]
 
-        fiber_norm = torch.linalg.norm(fiber, dim=1, keepdim=True).clamp_min(1e-12)
+        angle_eps = 1e-6
+        fiber_norm = torch.linalg.norm(fiber, dim=1, keepdim=True).clamp_min(angle_eps)
         fiber = fiber / fiber_norm
 
         ax = fiber[:, 0]
         ay = fiber[:, 1]
         az = fiber[:, 2]
 
-        phi = torch.atan2(ay, ax)
-        theta = torch.acos(torch.clamp(az, -1.0, 1.0))
+        xy_norm = torch.linalg.norm(fiber[:, :2], dim=1)
+        ax_safe = torch.where(xy_norm > angle_eps, ax, torch.ones_like(ax))
+        ay_safe = torch.where(xy_norm > angle_eps, ay, torch.zeros_like(ay))
+        phi = torch.atan2(ay_safe, ax_safe)
+        theta = torch.acos(torch.clamp(az, -1.0 + angle_eps, 1.0 - angle_eps))
 
         return {
             "density": density,

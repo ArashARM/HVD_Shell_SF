@@ -205,7 +205,7 @@ class TrainingConfig:
     lr_boundary_heads: float = 2e-4
 
     log_every: int = 50
-    early_stop_start: int = 300
+    early_stop_start: float = 0.30
     patience: int = 300
     min_delta: float = 1e-4
     prune_inactive_on_plateau: bool = True
@@ -237,6 +237,7 @@ class TrainingConfig:
 
     save_fem_debug_history: bool = True
     grad_clip_norm: float | None = 1.0
+    debug_anomaly_detection: bool = False
 
     tensorboard_enabled: bool = True
     tensorboard_log_root: str = "runs"
@@ -1524,6 +1525,12 @@ class NN_Trainer:
         warmup_step = int(round(float(cfg.allow_seed_outside_domain_warmup_frac) * float(cfg.num_steps)))
         return int(step) >= warmup_step
 
+    def early_stop_start_step(self) -> int:
+        value = float(self.cfg.early_stop_start)
+        if 0.0 <= value <= 1.0:
+            return int(round(value * float(self.cfg.num_steps)))
+        return int(round(value))
+
     @staticmethod
     def min_pairwise_seed_distance(seeds_list: list[torch.Tensor]) -> float:
         min_seed_dist = float("inf")
@@ -2577,6 +2584,59 @@ class NN_Trainer:
             if g is not None and not torch.isfinite(g).all():
                 bad.append((mi, pn))
         return bad
+
+    @classmethod
+    def _nonfinite_grad_cause_summary(
+        cls,
+        modules,
+        bad_grad_info,
+        loss_terms=None,
+        fem_is_valid=True,
+        fem_failure_reason=None,
+    ) -> str:
+        reasons = []
+
+        if loss_terms:
+            bad_losses = []
+            finite_losses = []
+            for name, value in loss_terms:
+                if value is None:
+                    continue
+                if cls._scalar_tensor_is_finite(value):
+                    raw = float(value.detach().item()) if isinstance(value, torch.Tensor) else float(value)
+                    finite_losses.append((name, raw))
+                else:
+                    bad_losses.append(name)
+
+            if bad_losses:
+                reasons.append("non-finite loss term(s): " + ", ".join(bad_losses[:5]))
+            elif finite_losses:
+                largest_name, largest_value = max(finite_losses, key=lambda item: abs(item[1]))
+                reasons.append(f"all tracked losses finite; largest={largest_name}={largest_value:.3e}")
+
+        if not fem_is_valid:
+            if fem_failure_reason:
+                reasons.append(f"FEM invalid: {fem_failure_reason}")
+            else:
+                reasons.append("FEM invalid")
+
+        bad_set = set(bad_grad_info)
+        for mi, pn, p in cls._named_trainable_params(modules):
+            if (mi, pn) not in bad_set or p.grad is None:
+                continue
+            g = p.grad.detach()
+            nan_count = int(torch.isnan(g).sum().item())
+            posinf_count = int(torch.isposinf(g).sum().item())
+            neginf_count = int(torch.isneginf(g).sum().item())
+            reasons.append(f"bad grad at face={mi}:{pn} (nan={nan_count}, +inf={posinf_count}, -inf={neginf_count})")
+            break
+
+        if not reasons:
+            reasons.append("likely backward overflow or unstable derivative")
+        elif loss_terms and not any(reason.startswith("non-finite loss") for reason in reasons):
+            reasons.append("likely backward overflow or unstable derivative")
+
+        return "Cause: " + "; ".join(reasons)
 
     @classmethod
     def _nonfinite_param_info(cls, modules):
@@ -4687,6 +4747,9 @@ class NN_Trainer:
         history = []
 
         self.current_face_tensors = face_tensors
+        debug_anomaly_detection = bool(getattr(cfg, "debug_anomaly_detection", False))
+        if debug_anomaly_detection:
+            torch.autograd.set_detect_anomaly(True, check_nan=True)
 
         # ------------------------------------------------------------
         # Training loop
@@ -5283,6 +5346,17 @@ class NN_Trainer:
                         L_total = L_total + cfg.lam_fem * loss_fem
 
                 total_is_finite = self._scalar_tensor_is_finite(L_total)
+                loss_debug_terms = [
+                    ("L_total", L_total),
+                    ("loss_vol", loss_vol),
+                    ("loss_rep", loss_rep),
+                    ("loss_bnd", loss_bnd),
+                    ("loss_strut", loss_strut),
+                    ("loss_width_active", loss_width_active),
+                    ("loss_seed_active", loss_seed_active),
+                    ("loss_fem", loss_fem),
+                    ("loss_comp", loss_comp),
+                ]
 
                 # ----------------------------------------------------
                 # Backprop
@@ -5294,12 +5368,16 @@ class NN_Trainer:
 
                     bad_grad_info = self._nonfinite_grad_info(ppnets)
                     if bad_grad_info:
-                        bad_grad_desc = ", ".join(
-                            f"face={mi}:{pn}" for mi, pn in bad_grad_info[:8]
+                        cause_desc = self._nonfinite_grad_cause_summary(
+                            ppnets,
+                            bad_grad_info,
+                            loss_terms=loss_debug_terms,
+                            fem_is_valid=fem_is_valid,
+                            fem_failure_reason=fem_failure_reason,
                         )
                         tqdm.write(
-                            f"[step {step}] Non-finite gradients detected, optimizer step skipped. "
-                            f"Examples: {bad_grad_desc}"
+                            f"[step {step}] Non-finite gradients detected; optimizer step skipped. "
+                            f"{cause_desc}."
                         )
                         for _mi, _pn, p in self._named_trainable_params(ppnets):
                             if p.grad is not None:
@@ -5318,12 +5396,16 @@ class NN_Trainer:
 
                         bad_grad_info = self._nonfinite_grad_info(ppnets)
                         if bad_grad_info:
-                            bad_grad_desc = ", ".join(
-                                f"face={mi}:{pn}" for mi, pn in bad_grad_info[:8]
+                            cause_desc = self._nonfinite_grad_cause_summary(
+                                ppnets,
+                                bad_grad_info,
+                                loss_terms=loss_debug_terms,
+                                fem_is_valid=fem_is_valid,
+                                fem_failure_reason=fem_failure_reason,
                             )
                             tqdm.write(
                                 f"[step {step}] Non-finite gradients remained after clipping, "
-                                f"optimizer step skipped. Examples: {bad_grad_desc}"
+                                f"optimizer step skipped. {cause_desc}."
                             )
                             for _mi, _pn, p in self._named_trainable_params(ppnets):
                                 if p.grad is not None:
@@ -5754,7 +5836,7 @@ class NN_Trainer:
                                 f"{old_seed_count_current} seed slots remain."
                             )
 
-                    if step >= cfg.early_stop_start and steps_since_improve >= cfg.patience:
+                    if step >= self.early_stop_start_step() and steps_since_improve >= cfg.patience:
                         tqdm.write(
                             f"Early stopping at step {step} | "
                             f"best_step={best_step} | best_score={best_score:.6f} |"
@@ -6067,6 +6149,9 @@ class NN_Trainer:
                     tqdm.write(f"Saved optimized shell function: {optimized_function_path}")
             except Exception as e:
                 tqdm.write(f"Failed to save optimized shell function: {e}")
+
+        if debug_anomaly_detection:
+            torch.autograd.set_detect_anomaly(False)
 
         return {
             "decoders": decoders,
