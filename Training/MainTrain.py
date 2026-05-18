@@ -1268,6 +1268,24 @@ class NN_Trainer:
         except Exception:
             pass
 
+    def _soft_project_density(self, rho: torch.Tensor) -> torch.Tensor:
+        strength = float(self.cfg.density_projection_strength)
+        if strength <= 0.0:
+            return rho
+
+        threshold = torch.as_tensor(
+            self.cfg.density_projection_threshold,
+            device=rho.device,
+            dtype=rho.dtype,
+        )
+        gamma = torch.as_tensor(
+            self.cfg.density_projection_gamma,
+            device=rho.device,
+            dtype=rho.dtype,
+        ).clamp_min(self.cfg.eps)
+        rho_proj = torch.sigmoid((rho - threshold) / gamma)
+        return ((1.0 - strength) * rho + strength * rho_proj).clamp(0.0, 1.0)
+
     def _tb_log_step(
         self,
         step: int,
@@ -5147,6 +5165,7 @@ class NN_Trainer:
                 rho = rho_acc / rho_wgt.clamp_min(cfg.eps)
                 rho_boundary = rho_b_acc / rho_b_wgt.clamp_min(cfg.eps)
                 rho_v_all = rho_v_acc / rho_v_wgt.clamp_min(cfg.eps)
+                rho_v_eff_all = self._soft_project_density(rho_v_all)
                 rho_s_all = rho_s_acc / rho_s_wgt.clamp_min(cfg.eps)
 
                 fiber_surface = fiber_acc / fiber_wgt.clamp_min(cfg.eps)[:, None]
@@ -5186,7 +5205,7 @@ class NN_Trainer:
                     eps=cfg.eps,
                 )
                 vol_frac_eff = self.loss_volume.powered_fraction(
-                    rho=rho_v_all,
+                    rho=rho_v_eff_all,
                     A_v=A_v,
                     power=cfg.effective_volume_power,
                     eps=cfg.eps,
@@ -5210,7 +5229,7 @@ class NN_Trainer:
                     )
 
                     loss_vol_eff_v, vol_frac_eff = self.loss_volume.powered(
-                        rho=rho_v_all,
+                        rho=rho_v_eff_all,
                         A_v=A_v,
                         target_volfrac=cfg.target_volfrac,
                         power=cfg.effective_volume_power,
@@ -5245,7 +5264,7 @@ class NN_Trainer:
                             boundary_weight=cfg.boundary_vol_weight,
                             eps=cfg.eps,
                         )
-                        loss_vol_eff_weighted, vol_frac_eff = self.loss_volume.powered(
+                        loss_vol_eff_weighted, vol_frac_eff_weighted = self.loss_volume.powered(
                             rho=rho,
                             A_v=(1.0 - rho_boundary + cfg.boundary_vol_weight * rho_boundary) * A_v,
                             target_volfrac=cfg.target_volfrac,
