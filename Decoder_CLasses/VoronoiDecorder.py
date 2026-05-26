@@ -6,9 +6,10 @@ import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 import pyvista as pv
-
 from dataclasses import dataclass
 from typing import Any, Callable
+from scipy.spatial import Voronoi, voronoi_plot_2d
+
 
 
 class VoronoiDecoder(nn.Module):
@@ -1912,6 +1913,10 @@ class VoronoiDecoder(nn.Module):
         )
 
 
+
+
+
+
 @dataclass
 class MeshQueryData:
     points_uv: torch.Tensor
@@ -1931,7 +1936,6 @@ class MeshQueryData:
     point_domain_mask: torch.Tensor | Callable[[torch.Tensor], torch.Tensor] | None = None
     point_domain_mask_threshold: float = 0.5
     point_domain_temp: float | torch.Tensor | None = None
-
 
 class VoronoiModelVisualizer:
     """
@@ -2817,3 +2821,69 @@ class VoronoiModelVisualizer:
             )
 
         return result
+
+
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+from scipy.spatial import Voronoi, voronoi_plot_2d
+
+
+class ExactUVVoronoi:
+    def __init__(self, seeds_all, active_mask=None):
+        self.seeds_all = seeds_all
+        self.active_mask = active_mask
+
+    def _to_numpy(self, x):
+        if torch.is_tensor(x):
+            x = x.detach().cpu().numpy()
+        return np.asarray(x)
+
+    def get_seeds(self):
+        seeds = self.seeds_all
+
+        if self.active_mask is not None:
+            mask = self.active_mask
+            if torch.is_tensor(mask):
+                mask = mask.detach().cpu().bool()
+            seeds = seeds[mask]
+
+        seeds_np = self._to_numpy(seeds).reshape(-1, 2)
+        return seeds_np
+
+    def show(self, figsize=(7, 7), title="Exact Voronoi Skeleton in UV"):
+        seeds_np = self.get_seeds()
+
+        print("seeds used:", seeds_np.shape[0])
+
+        if self.active_mask is not None:
+            mask = self.active_mask
+            inactive = (~mask).sum().item() if torch.is_tensor(mask) else np.sum(~mask)
+            print("inactive seeds:", inactive)
+
+        if seeds_np.shape[0] < 4:
+            raise ValueError("Voronoi needs at least 4 points in 2D.")
+
+        vor = Voronoi(seeds_np, qhull_options="QJ")
+
+        fig, ax = plt.subplots(figsize=figsize)
+
+        voronoi_plot_2d(
+            vor,
+            ax=ax,
+            show_vertices=False,
+            show_points=True,
+            line_width=1.5,
+            line_alpha=0.8,
+        )
+
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.set_aspect("equal")
+
+        ax.set_xlabel("u")
+        ax.set_ylabel("v")
+        ax.set_title(title)
+        ax.grid(False)
+
+        return fig, ax
