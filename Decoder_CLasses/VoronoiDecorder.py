@@ -667,9 +667,21 @@ class VoronoiDecoder(nn.Module):
             )
 
         pair_dist = self._pairwise_seed_dist(seeds, seed_face_id=seed_face_id).to(device=w_raw.device, dtype=w_raw.dtype)
-        w_max_pair = (self.w_max_ratio * pair_dist).clamp_min(self.w_min + self.eps)
-        w_geo = self.w_min + (w_max_pair - self.w_min) * torch.sigmoid(w_raw / T)
-        return 0.5 * (w_geo + w_geo.transpose(0, 1))
+        pair_mask = torch.triu(
+            torch.ones_like(pair_dist, dtype=torch.bool),
+            diagonal=1,
+        )
+        if bool(pair_mask.any()):
+            min_pair_dist = pair_dist[pair_mask].amin()
+            width_raw_global = w_raw[pair_mask].mean()
+        else:
+            min_pair_dist = torch.zeros((), device=w_raw.device, dtype=w_raw.dtype)
+            width_raw_global = w_raw.mean()
+
+        w_max = (self.w_max_ratio * min_pair_dist).clamp_min(self.w_min)
+        width_frac = 0.5 * (torch.tanh(width_raw_global / max(T, self.eps)) + 1.0)
+        w_geo = self.w_min + (w_max - self.w_min) * width_frac
+        return w_geo.expand_as(w_raw)
 
     def height(
         self,

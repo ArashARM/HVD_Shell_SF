@@ -144,7 +144,8 @@ class PPNet(nn.Module):
 
     @property
     def w_head(self):
-        return self.width_predictor.w_head
+        # The trainer still groups width parameters through this legacy name.
+        return self.width_predictor
 
     @property
     def h_head(self):

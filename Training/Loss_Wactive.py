@@ -25,8 +25,7 @@ class Loss_Wactive:
             return torch.zeros((), dtype=w_raw.dtype, device=w_raw.device)
 
         tri_mask = torch.triu(torch.ones((s, s), dtype=torch.bool, device=w_raw.device), diagonal=1)
-        logits = w_raw / max(float(raw_temp), eps)
-        width_frac = torch.sigmoid(logits)
+        width_frac = 0.5 * (torch.tanh(w_raw / max(float(raw_temp), eps)) + 1.0)
 
         if seed_active_weights is None:
             target_frac_eff = float(width_target_frac)

@@ -5,7 +5,7 @@ from .utils import check_finite
 
 
 class WidthPredictor(nn.Module):
-    """Predict symmetric pairwise widths, or return a fixed width matrix."""
+    """Expand one global raw strut-width parameter to the decoder matrix shape."""
 
     def __init__(
         self,
@@ -20,22 +20,15 @@ class WidthPredictor(nn.Module):
         self.w_const = w_const
         self.enable_checks = enable_checks
 
-        self.w_head = nn.Linear(hidden, 1)
-        nn.init.zeros_(self.w_head.weight)
-        nn.init.constant_(self.w_head.bias, w_head_bias_init)
+        self.w_raw = nn.Parameter(torch.tensor(float(w_head_bias_init)))
 
     def forward(self, h, n_seeds, z):
         if self.freeze_w:
-            w_raw = torch.full(
-                (n_seeds, n_seeds),
-                self.w_const,
-                device=z.device,
-                dtype=z.dtype,
-            )
+            raw = torch.as_tensor(self.w_const, device=z.device, dtype=z.dtype)
         else:
-            pair_h = 0.5 * (h.unsqueeze(1) + h.unsqueeze(0))
-            w_raw = self.w_head(pair_h).squeeze(-1)
-            w_raw = 0.5 * (w_raw + w_raw.transpose(0, 1))
+            raw = self.w_raw.to(device=z.device, dtype=z.dtype)
+
+        w_raw = raw.expand(n_seeds, n_seeds)
 
         check_finite(w_raw, "w_raw", self.enable_checks)
         return w_raw

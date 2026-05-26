@@ -129,7 +129,7 @@ class TrainingConfig:
     w_min: float = 0.005
     min_feature_size_3d: float | None = None
     auto_update_wmin: bool = False
-    w_max_ratio: float = 0.5  # Deprecated: pairwise widths now use 0.8 * seed distance as the upper bound.
+    w_max_ratio: float = 0.5  # Maximum uniform strut width as a fraction of the closest seed spacing.
 
     lam_fem: float = 1.0
     lam_vol: float = 2.0
@@ -2218,9 +2218,9 @@ class NN_Trainer:
             w_const=self.cfg.w_const,   
             w_head_bias_init=(
                 float(self.cfg.decoder_raw_temp)
-                * math.log(
-                    max(min(float(self.cfg.width_target_frac), 1.0 - 1e-4), 1e-4)
-                    / max(1.0 - min(float(self.cfg.width_target_frac), 1.0 - 1e-4), 1e-4)
+                * math.atanh(
+                    2.0 * max(min(float(self.cfg.width_target_frac), 1.0 - 1e-4), 1e-4)
+                    - 1.0
                 )
                 if self.cfg.w_head_bias_init is None
                 else float(self.cfg.w_head_bias_init)
@@ -4058,6 +4058,181 @@ class NN_Trainer:
         res_u = max(int(min_res), min(int(max_res), res_u))
         res_v = max(int(min_res), min(int(max_res), res_v))
         return res_u, res_v
+
+    @staticmethod
+    def _dense_face_triangles(mask_dense_valid, grid_shape):
+        mask = np.asarray(mask_dense_valid, dtype=bool).reshape(-1)
+        Nu, Nv = (int(grid_shape[0]), int(grid_shape[1]))
+        full_indices = -np.ones(mask.shape[0], dtype=np.int64)
+        full_indices[mask] = np.arange(np.count_nonzero(mask), dtype=np.int64)
+        triangles = []
+
+        def idx(i, j):
+            return i * Nv + j
+
+        for i in range(Nu - 1):
+            for j in range(Nv - 1):
+                ids = [idx(i, j), idx(i, j + 1), idx(i + 1, j), idx(i + 1, j + 1)]
+                mapped = [full_indices[k] for k in ids]
+                if any(m < 0 for m in mapped):
+                    continue
+                i0, i1, i2, i3 = mapped
+                triangles.append([i0, i1, i2])
+                triangles.append([i2, i1, i3])
+
+        return np.asarray(triangles, dtype=np.int64)
+
+    def visualize_result_final_edge_field(
+        self,
+        result,
+        shape_or_path=None,
+        grid_res_u: int = 120,
+        grid_res_v: int = 120,
+        uv_mask_tol: float | None = None,
+        dense_factor: float = 1.0,
+        cmap: str = "viridis",
+        show_seeds: bool = True,
+        show_uv: bool = True,
+        show_3d: bool = True,
+    ):
+        """Plot the decoder's geometric Voronoi edge field in UV and on the CAD surface."""
+        if not show_uv and not show_3d:
+            raise ValueError("At least one of show_uv or show_3d must be True.")
+
+        grid_res_u, grid_res_v = self._resolve_visualization_grid_resolution(
+            grid_res_u=grid_res_u,
+            grid_res_v=grid_res_v,
+            dense_factor=dense_factor,
+        )
+        dense = self.sample_result_field_dense_for_visualization(
+            result=result,
+            shape_or_path=shape_or_path,
+            grid_res_u=grid_res_u,
+            grid_res_v=grid_res_v,
+            uv_mask_tol=uv_mask_tol,
+            use_best_pred=True,
+        )
+
+        pred_by_face_id = {p["face_id"]: p for p in result["best_pred"]}
+        face_plots = []
+        for face_data in dense["per_face"]:
+            mask = face_data["mask_dense_valid"].detach().cpu().numpy()
+            triangles = self._dense_face_triangles(mask, face_data["grid_shape"])
+            face_plots.append(
+                {
+                    "face_id": face_data["face_id"],
+                    "uv": face_data["uv_dense"].detach().cpu().numpy().astype(np.float32),
+                    "xyz": face_data["xyz_dense"].detach().cpu().numpy().astype(np.float32),
+                    "edge_field": face_data["edge_field_dense"].detach().cpu().numpy().astype(np.float32),
+                    "triangles": triangles,
+                }
+            )
+
+        uv_fig = None
+        if show_uv:
+            n_faces = len(face_plots)
+            ncols = min(3, max(1, n_faces))
+            nrows = int(np.ceil(float(n_faces) / float(ncols)))
+            uv_fig, axes = plt.subplots(
+                nrows,
+                ncols,
+                figsize=(5.6 * ncols, 5.0 * nrows),
+                squeeze=False,
+                constrained_layout=True,
+            )
+            color_artist = None
+            for ax, face_plot in zip(axes.ravel(), face_plots):
+                uv = face_plot["uv"]
+                triangles = face_plot["triangles"]
+                edge_field = face_plot["edge_field"]
+                if triangles.size > 0:
+                    color_artist = ax.tripcolor(
+                        uv[:, 0],
+                        uv[:, 1],
+                        triangles,
+                        edge_field,
+                        shading="gouraud",
+                        cmap=cmap,
+                        vmin=0.0,
+                        vmax=1.0,
+                    )
+                else:
+                    color_artist = ax.scatter(
+                        uv[:, 0],
+                        uv[:, 1],
+                        c=edge_field,
+                        s=6,
+                        linewidths=0,
+                        cmap=cmap,
+                        vmin=0.0,
+                        vmax=1.0,
+                    )
+
+                if show_seeds:
+                    pred = pred_by_face_id.get(face_plot["face_id"])
+                    if pred is not None:
+                        seeds_uv = pred["seeds_raw"].detach().cpu().numpy()
+                        ax.scatter(
+                            seeds_uv[:, 0],
+                            seeds_uv[:, 1],
+                            s=38,
+                            c="#e04b3f",
+                            edgecolors="white",
+                            linewidths=1.0,
+                            zorder=3,
+                        )
+                ax.set_title(f"Face {face_plot['face_id']} | Edge Field")
+                ax.set_xlabel("u")
+                ax.set_ylabel("v")
+                ax.set_aspect("equal", adjustable="box")
+
+            for ax in axes.ravel()[len(face_plots):]:
+                ax.axis("off")
+            if color_artist is not None:
+                uv_fig.colorbar(color_artist, ax=axes.ravel().tolist(), label="edge_field")
+            uv_fig.suptitle("Geometric Voronoi Edge Field in UV", y=1.02)
+            plt.show()
+
+        plotter = None
+        if show_3d:
+            plotter = pv.Plotter()
+            for face_plot in face_plots:
+                triangles = face_plot["triangles"]
+                if triangles.size == 0:
+                    continue
+                pv_faces = np.empty((triangles.shape[0], 4), dtype=np.int64)
+                pv_faces[:, 0] = 3
+                pv_faces[:, 1:] = triangles
+                mesh = pv.PolyData(face_plot["xyz"], pv_faces.reshape(-1))
+                mesh["edge_field"] = face_plot["edge_field"]
+                plotter.add_mesh(
+                    mesh,
+                    scalars="edge_field",
+                    cmap=cmap,
+                    clim=[0.0, 1.0],
+                    show_edges=False,
+                    scalar_bar_args={"title": "edge_field"},
+                )
+
+            seed_points_final = result.get("seed_points_final")
+            if show_seeds and seed_points_final is not None:
+                plotter.add_mesh(
+                    seed_points_final,
+                    render_points_as_spheres=True,
+                    point_size=6,
+                    color="#e04b3f",
+                )
+            plotter.add_text("Geometric Voronoi Edge Field", font_size=11)
+            plotter.show_axes()
+            plotter.show()
+
+        return {
+            "uv_fig": uv_fig,
+            "plotter": plotter,
+            "dense": dense,
+            "per_face": face_plots,
+            "grid_shape": (grid_res_u, grid_res_v),
+        }
 
     def visualize_result_final_smooth_points(
         self,
