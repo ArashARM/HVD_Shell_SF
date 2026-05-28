@@ -921,6 +921,16 @@ class VoronoiDecoder(nn.Module):
         Q_ij = t_ij.unsqueeze(-1) * t_ij.unsqueeze(-2)     # (S,S,2,2)
         return (pair_weights.unsqueeze(-1).unsqueeze(-1) * Q_ij.unsqueeze(0)).sum(dim=(1, 2))
 
+    def _axial_tensor_from_local_pair_tangents(
+        self,
+        pair_weights: torch.Tensor,
+        pair_tangent_ij: torch.Tensor,
+    ) -> torch.Tensor:
+        pair_weights = torch.nan_to_num(pair_weights, nan=0.0, posinf=0.0, neginf=0.0)
+        pair_tangent_ij = torch.nan_to_num(pair_tangent_ij, nan=0.0, posinf=0.0, neginf=0.0)
+        Q_ij = pair_tangent_ij.unsqueeze(-1) * pair_tangent_ij.unsqueeze(-2)
+        return (pair_weights.unsqueeze(-1).unsqueeze(-1) * Q_ij).sum(dim=(1, 2))
+
     def _principal_axial_direction(self, Q: torch.Tensor) -> torch.Tensor:
         Q = torch.nan_to_num(Q, nan=0.0, posinf=0.0, neginf=0.0)
         Q = 0.5 * (Q + Q.transpose(-1, -2))
@@ -1280,16 +1290,17 @@ class VoronoiDecoder(nn.Module):
         p3 = (a * a * a).sum(dim=1)
         e3 = (p1 * p1 * p1 - 3.0 * p1 * p2 + 2.0 * p3) / 6.0
         return e3.clamp_min(0.0)
-
+    
     # -------------------- bisector band density --------------------
     def _bisector_band_density(
         self,
-        points: torch.Tensor,          # (N, 2) query UV points
-        seeds: torch.Tensor,           # (S, 2)
-        d: torch.Tensor,               # (N, S)
-        w_soft: torch.Tensor,          # (N, S)
-        w_geo: torch.Tensor,
-        beta: float | torch.Tensor,
+        points: torch.Tensor,          # (N, 2) query UV points x_n
+        seeds: torch.Tensor,           # (S, 2) seeds s_i
+        d: torch.Tensor,               # (N, S), d_ni = metric distance from x_n to s_i
+        w_soft: torch.Tensor,          # (N, S), soft Voronoi weights w_ni
+        w_geo: torch.Tensor,           # (S, S), geometric half-width w_ij
+        beta: float | torch.Tensor,    # smoothness parameter beta
+        M: torch.Tensor,               # (S, 2, 2), metric matrices M_i
         seed_active_weights: torch.Tensor | None = None,
         seed_duplicate_weights: torch.Tensor | None = None,
         seed_domain_weights: torch.Tensor | None = None,
@@ -1298,10 +1309,25 @@ class VoronoiDecoder(nn.Module):
     ):
         N, S = d.shape
 
-        # --------------------------------------------------
+        # ==================================================
         # 1. Structural seed weights
-        # --------------------------------------------------
+        # ==================================================
+        # Math:
+        #   w_struct_ni = w_soft_ni * a_i
+        #
+        # Then normalize:
+        #   w_struct_ni =
+        #   w_struct_ni / sum_j w_struct_nj
+        #
+        # Role:
+        #   If seeds are inactive, duplicated, or outside domain,
+        #   reduce their influence in pair relevance.
+        #
+        # If no seed_active_weights is given:
+        #   w_struct = w_soft
+
         w_struct = w_soft
+
         seed_activity = torch.ones(S, device=d.device, dtype=d.dtype)
         duplicate_activity = torch.ones(S, device=d.device, dtype=d.dtype)
         domain_activity = torch.ones(S, device=d.device, dtype=d.dtype)
@@ -1310,10 +1336,15 @@ class VoronoiDecoder(nn.Module):
         if seed_active_weights is not None:
             if seed_active_weights.ndim != 1 or seed_active_weights.shape[0] != S:
                 raise ValueError(
-                    f"seed_active_weights must have shape ({S},), got {tuple(seed_active_weights.shape)}"
+                    f"seed_active_weights must have shape ({S},), "
+                    f"got {tuple(seed_active_weights.shape)}"
                 )
 
-            seed_activity = seed_active_weights.to(device=d.device, dtype=d.dtype).clamp(0.0, 1.0)
+            seed_activity = seed_active_weights.to(
+                device=d.device,
+                dtype=d.dtype,
+            ).clamp(0.0, 1.0)
+
             if seed_duplicate_weights is None:
                 duplicate_activity = seed_activity
             else:
@@ -1326,6 +1357,7 @@ class VoronoiDecoder(nn.Module):
                     device=d.device,
                     dtype=d.dtype,
                 ).clamp(0.0, 1.0)
+
             if seed_domain_weights is None:
                 domain_activity = seed_activity
             else:
@@ -1338,23 +1370,43 @@ class VoronoiDecoder(nn.Module):
                     device=d.device,
                     dtype=d.dtype,
                 ).clamp(0.0, 1.0)
+
             if hard_seed_mask:
                 active_seed = seed_activity > 0.0
+
             w_struct = w_soft * seed_activity.unsqueeze(0)
             w_struct_sum = w_struct.sum(dim=1, keepdim=True)
+
             w_struct = torch.where(
                 w_struct_sum > self.eps,
                 w_struct / w_struct_sum.clamp_min(self.eps),
                 w_soft,
             )
+
+        # ==================================================
+        # 2. Pair activity
+        # ==================================================
+        # Math:
+        #   A_ij =
+        #   (domain_i domain_j)^p_domain
+        #   (duplicate_i duplicate_j)^p_duplicate
+        #
+        # Role:
+        #   Pair (i,j) is active only if both seeds are valid.
+
         pair_activity = (
-            (domain_activity[:, None] * domain_activity[None, :]).pow(float(self.domain_pair_power))
-            * (duplicate_activity[:, None] * duplicate_activity[None, :]).pow(
+            (domain_activity[:, None] * domain_activity[None, :]).pow(
+                float(self.domain_pair_power)
+            )
+            *
+            (duplicate_activity[:, None] * duplicate_activity[None, :]).pow(
                 float(self.duplicate_pair_power)
             )
         )
+
         if hard_seed_mask and seed_active_weights is not None:
             active_count = active_seed.to(dtype=d.dtype).sum()
+
             if bool(active_seed.any()):
                 global_activity = seed_activity[active_seed].amax().clamp(0.0, 1.0)
             else:
@@ -1362,73 +1414,146 @@ class VoronoiDecoder(nn.Module):
         else:
             active_count = torch.as_tensor(float(S), device=d.device, dtype=d.dtype)
             global_activity = seed_activity.amax().clamp(0.0, 1.0)
+
         global_activity = global_activity.pow(float(self.global_activity_power))
 
-        # --------------------------------------------------
-        # 2. Pairwise distance difference
-        # --------------------------------------------------
+        # ==================================================
+        # 3. Pairwise distance difference
+        # ==================================================
+        # Math:
+        #   delta_nij = d_ni - d_nj
+        #
+        # Voronoi edge condition:
+        #   d_ni = d_nj
+        #   delta_nij = 0
+        #
+        # Role:
+        #   The zero level set of delta_nij is the bisector
+        #   between seed i and seed j.
+
         d_i = d.unsqueeze(2)  # (N, S, 1)
         d_j = d.unsqueeze(1)  # (N, 1, S)
 
         delta = d_i - d_j
         abs_delta = torch.sqrt(delta * delta + self.eps)
 
-        # --------------------------------------------------
-        # 3. Convert |d_i - d_j| to true distance to bisector
-        # --------------------------------------------------
-        # vector from seed to point
+        # ==================================================
+        # 4. Metric gradient and true distance approximation
+        # ==================================================
+        # Metric distance:
+        #
+        #   d_i(x) = sqrt((x - s_i)^T M_i (x - s_i))
+        #
+        # Define:
+        #   v_ni = x_n - s_i
+        #
+        # Gradient:
+        #
+        #   grad d_i(x_n) = M_i v_ni / d_ni
+        #
+        # Then:
+        #
+        #   grad(delta_ij) = grad d_i - grad d_j
+        #
+        # Approximate geometric distance to bisector:
+        #
+        #   D_nij =
+        #   |d_ni - d_nj| / ||grad d_i - grad d_j||
+        #
+        # Role:
+        #   Converts distance difference into approximate perpendicular
+        #   geometric distance to the bisector.
+        #
+        # In Euclidean case:
+        #   M_i = I
+        # so:
+        #   grad d_i = (x - s_i) / d_i
+
+        if M.ndim != 3 or M.shape != (S, 2, 2):
+            raise ValueError(f"M must be (S, 2, 2), got {tuple(M.shape)}")
+
+        M = M.to(device=d.device, dtype=d.dtype)
+
         x_minus_s = points.unsqueeze(1) - seeds.unsqueeze(0)  # (N, S, 2)
 
-        # unit direction from seed to point
-        unit = x_minus_s / d.unsqueeze(2).clamp_min(self.eps)  # (N, S, 2)
+        grad_d = torch.einsum(
+            "sij,nsj->nsi",
+            M,
+            x_minus_s,
+        )
 
-        unit_i = unit.unsqueeze(2)  # (N, S, 1, 2)
-        unit_j = unit.unsqueeze(1)  # (N, 1, S, 2)
+        grad_d = grad_d / d.unsqueeze(2).clamp_min(self.eps)
 
-        grad_vec = unit_i - unit_j
-        grad_norm = torch.sqrt((grad_vec * grad_vec).sum(dim=-1) + self.eps)  # (N, S, S)
+        grad_vec = grad_d.unsqueeze(2) - grad_d.unsqueeze(1)
+        grad_norm = torch.sqrt((grad_vec * grad_vec).sum(dim=-1) + self.eps)
 
-        # This is the important correction:
-        # true_dist is approximately perpendicular distance to the bisector
         true_dist = abs_delta / grad_norm.clamp_min(self.eps)
 
-        # --------------------------------------------------
-        # 4. Ambiguity / junction information
-        # --------------------------------------------------
-        ambiguity = (1.0 - w_struct.pow(2).sum(dim=1)).clamp(0.0, 1.0)
+        pair_tangent_ij = torch.stack(
+            [-grad_vec[..., 1], grad_vec[..., 0]],
+            dim=-1,
+        )
+        pair_tangent_ij = pair_tangent_ij / torch.norm(
+            pair_tangent_ij,
+            dim=-1,
+            keepdim=True,
+        ).clamp_min(self.eps)
 
         beta_t = torch.as_tensor(beta, device=d.device, dtype=d.dtype)
-
-        # Start clean: do NOT widen bands using ambiguity yet
         beta_eff = beta_t
         w_geo_eff = w_geo
 
-        # Later, after geometry looks good, you may restore:
+        # ==================================================
+        # 5. Pair distinctness
+        # ==================================================
+        # Math:
+        #   D_ij approx 0 when ||s_i - s_j|| is very small
+        #   D_ij approx 1 when seeds are well separated
         #
-        # beta_eff = beta_t * (
-        #     1.0 + self.junction_beta_scale * ambiguity.unsqueeze(1).unsqueeze(2)
-        # )
-        #
-        # w_geo_eff = w_geo * (
-        #     1.0 + self.junction_width_bonus * ambiguity.unsqueeze(1).unsqueeze(2)
-        # )
+        # Role:
+        #   Prevents duplicate or near-duplicate seeds from creating
+        #   meaningless bisector bands.
 
-        # --------------------------------------------------
-        # 5. Valid seed-pair mask
-        # --------------------------------------------------
         pair_distinctness = self._pair_distinctness(
             seeds=seeds,
             device=d.device,
             dtype=d.dtype,
             seed_face_id=seed_face_id,
         )
+
         if hard_seed_mask and seed_active_weights is not None:
             active_pair = active_seed[:, None] & active_seed[None, :]
             pair_distinctness = pair_distinctness * active_pair.to(dtype=d.dtype)
 
-        # --------------------------------------------------
-        # 6. Uniform-width bisector band
-        # --------------------------------------------------
+        # ==================================================
+        # 6. Smooth bisector band
+        # ==================================================
+        # Math:
+        #
+        #   B_raw_nij =
+        #   sigmoid((w_ij - D_nij) / beta)
+        #
+        # where:
+        #   D_nij = true distance to bisector
+        #   w_ij = geometric half-width
+        #
+        # Peak normalization:
+        #
+        #   B_nij =
+        #   sigmoid((w_ij - D_nij) / beta)
+        #   /
+        #   sigmoid(w_ij / beta)
+        #
+        # Role:
+        #   Makes the center of the band equal to 1:
+        #   if D_nij = 0, then B_nij = 1.
+        #
+        # beta:
+        #   controls edge softness.
+        #
+        # w_geo:
+        #   controls strut half-width.
+
         band_raw = torch.sigmoid(
             (w_geo_eff - true_dist) / (beta_eff + self.eps)
         )
@@ -1438,39 +1563,115 @@ class VoronoiDecoder(nn.Module):
         )
 
         band_ij = (band_raw / (band_peak + self.eps)).clamp(0.0, 1.0)
+
+        # Apply validity:
+        #
+        #   B_nij <- B_nij * pair_distinctness_ij * pair_activity_ij
+
         band_ij = band_ij * pair_distinctness
         band_ij = band_ij * pair_activity.unsqueeze(0)
 
-        # --------------------------------------------------
-        # 7. Pair relevance
-        # --------------------------------------------------
+        # ==================================================
+        # 7. Pair relevance from soft Voronoi weights
+        # ==================================================
+        # Math:
+        #   P_nij = w_struct_ni * w_struct_nj
+        #
+        # Role:
+        #   If two seeds do not both influence point x_n,
+        #   their pair should not strongly contribute.
+        #
+        # This suppresses non-neighbor seed-pair bands.
+
         pair_prod = w_struct.unsqueeze(2) * w_struct.unsqueeze(1)
+
+        # ==================================================
+        # 8. Effective seed count and junction boost
+        # ==================================================
+        # Math:
+        #   k_eff_n = 1 / sum_i w_ni^2
+        #
+        # Meaning:
+        #   k_eff approx 1 inside one cell
+        #   k_eff approx 2 near normal edge
+        #   k_eff approx 3 near triple junction
+        #
+        # Junction boost:
+        #
+        #   J_n =
+        #   1 + lambda * sigmoid((k_eff_n - threshold) / sharpness)
+        #
+        # Role:
+        #   Slightly boosts multi-seed competition regions.
 
         sum_w2 = w_struct.pow(2).sum(dim=1).clamp_min(self.eps)
         k_eff = 1.0 / sum_w2
 
-        junction_mult = 1.0 + self.junction_keff_lambda * torch.sigmoid(
-            (k_eff - self.junction_keff_k0)
-            / (self.junction_keff_s + self.eps)
+        lambda_junc = 0.15
+        sharp_junc = 0.25
+        junction_threshold = 1.5
+
+        junction_boost = 1.0 + lambda_junc * torch.sigmoid(
+            (k_eff - junction_threshold) / sharp_junc
         )
 
-        pair_relevance = (
-            ambiguity.unsqueeze(1).unsqueeze(2)
-            * pair_prod
-            * junction_mult.unsqueeze(1).unsqueeze(2)
-            * pair_distinctness
-            * pair_activity.unsqueeze(0)
+        # ==================================================
+        # 9. Pair gate and final pair strength
+        # ==================================================
+        # Pair gate:
+        #
+        #   G_nij =
+        #   sigmoid((P_nij - t) / s)
+        #
+        # Role:
+        #   Kills very weak non-neighbor pairs.
+        #
+        # Soft pair power:
+        #
+        #   P_nij^p
+        #
+        # Role:
+        #   p < 1 makes weak but valid pairs stronger,
+        #   improving strut uniformity.
+        #
+        # Final pair strength:
+        #
+        #   S_nij =
+        #   B_nij * P_nij^p * G_nij * J_n
+
+        pair_power = 0.3
+        pair_threshold = 0.03
+        pair_softness = 0.01
+
+        pair_gate = torch.sigmoid(
+            (pair_prod - pair_threshold) / pair_softness
         )
 
-        # IMPORTANT:
-        # Use pair_relevance, not only pair_prod.
-        pair_strength = pair_prod * band_ij
+        pair_strength = (
+            band_ij
+            * pair_prod.clamp_min(self.eps).pow(pair_power)
+            * pair_gate
+            * junction_boost[:, None, None]
+        )
 
-        # --------------------------------------------------
-        # 8. Optional pair boost
-        # --------------------------------------------------
+        pair_relevance = None
+
+        # ==================================================
+        # 10. Optional global pair-count boost
+        # ==================================================
+        # Math:
+        #   pair_boost =
+        #   1 + c * sigmoid(
+        #       (valid_pair_count - reference_pair_count)
+        #       / reference_pair_count
+        #   )
+        #
+        # Role:
+        #   Small global boost when there are many valid pairs.
+
         if self.pair_boost_enabled:
             active_pair_distinctness = pair_distinctness * pair_activity
+
             valid_pair_count = active_pair_distinctness.sum().clamp_min(1.0)
             reference_pair_count = (active_count - 1.0).clamp_min(1.0)
 
@@ -1481,22 +1682,37 @@ class VoronoiDecoder(nn.Module):
 
             pair_strength = pair_strength * pair_boost
 
-        # --------------------------------------------------
-        # 9. Final density
-        # --------------------------------------------------
+        # ==================================================
+        # 11. Smooth union density
+        # ==================================================
+        # Math:
+        #   R_n = sum_ij S_nij
+        #
+        #   rho_n = 1 - exp(-alpha_union * R_n)
+        #
+        # Role:
+        #   Combines all pair bands into one bounded density field.
+        #   Density saturates smoothly into [0, 1].
+
         R_pair = pair_strength.sum(dim=(1, 2))
-
-        R_junction = self._triple_junction_score(w_struct)
-
-        R = R_pair + self.junction_triple_lambda * R_junction * global_activity
+        R = R_pair
 
         rho = 1.0 - torch.exp(-self.alpha_union * R)
         rho = rho * global_activity
         rho = rho.clamp(0.0, 1.0)
 
-        # --------------------------------------------------
-        # 10. Pure geometric edge field
-        # --------------------------------------------------
+        # ==================================================
+        # 12. Pure geometric edge field
+        # ==================================================
+        # Math:
+        #   edge_field_n =
+        #   1 - product_ij (1 - B_nij)
+        #
+        # Role:
+        #   Shows geometric union of all bisector bands before
+        #   pair relevance weighting.
+        #   Useful for debugging geometry separately from density.
+
         band_soft = band_ij.clamp(0.0, 1.0)
 
         eye = torch.eye(S, dtype=torch.bool, device=band_soft.device).unsqueeze(0)
@@ -1510,8 +1726,7 @@ class VoronoiDecoder(nn.Module):
         edge_field = 1.0 - one_minus.prod(dim=2).prod(dim=1)
         edge_field = edge_field.clamp(0.0, 1.0)
 
-        return rho, pair_strength, band_ij, pair_relevance, edge_field
-
+        return rho, pair_strength, band_ij, pair_relevance, edge_field, pair_tangent_ij
     # -------------------- validation --------------------
 
     def _validate_inputs(
@@ -1670,6 +1885,7 @@ class VoronoiDecoder(nn.Module):
 
         seeds_eval = seeds
         d_eval = d
+        M_eval = M
         w_raw_eval = w_raw
         seed_active_weights_eval = seed_active_weights
         seed_duplicate_weights_eval = seed_duplicate_weights
@@ -1682,6 +1898,7 @@ class VoronoiDecoder(nn.Module):
             active_idx = torch.nonzero(seed_active_mask, as_tuple=False).flatten()
             seeds_eval = seeds.index_select(0, active_idx)
             d_eval = d.index_select(1, active_idx)
+            M_eval = M.index_select(0, active_idx)
             w_raw_eval = w_raw.index_select(0, active_idx).index_select(1, active_idx)
             seed_active_weights_eval = seed_active_weights.index_select(0, active_idx)
             seed_duplicate_weights_eval = seed_duplicate_weights.index_select(0, active_idx)
@@ -1706,13 +1923,21 @@ class VoronoiDecoder(nn.Module):
 
         w_geo = self.width(w_raw_eval, seeds=seeds_eval, seed_face_id=seed_face_id_eval)
 
-        rho_v, pair_strength, band_ij, pair_relevance, edge_field = self._bisector_band_density(
-            points =points_uv,
+        (
+            rho_v,
+            pair_strength,
+            band_ij,
+            pair_relevance,
+            edge_field,
+            pair_tangent_ij,
+        ) = self._bisector_band_density(
+            points=points_uv,
             seeds=seeds_eval,
             d=d_eval,
             w_soft=w_soft,
             w_geo=w_geo,
             beta=self.beta,
+            M=M_eval,
             seed_active_weights=seed_active_weights_eval,
             seed_duplicate_weights=seed_duplicate_weights_eval,
             seed_domain_weights=seed_domain_activity_weights_eval,
@@ -1759,13 +1984,11 @@ class VoronoiDecoder(nn.Module):
             seed_face_id=seed_face_id_eval,
         )
 
-        t_uv_raw, fiber_tensor_Q, fiber_pair_weights = self._blended_uv_fiber_axial(
-            weights=w_soft,
-            seeds=seeds_eval,
-            pair_weights=fiber_pair_weights,
-            normalize_pair_weights=False,
-            seed_face_id=seed_face_id_eval,
+        fiber_tensor_Q = self._axial_tensor_from_local_pair_tangents(
+            fiber_pair_weights,
+            pair_tangent_ij,
         )
+        t_uv_raw = self._principal_axial_direction(fiber_tensor_Q)
         fiber_tensor_Q_interior = fiber_tensor_Q
 
         if (
@@ -1845,6 +2068,7 @@ class VoronoiDecoder(nn.Module):
             "band_ij": band_ij,
             "pair_relevance": pair_relevance,
             "edge_field": edge_field,
+            "pair_tangent_ij": pair_tangent_ij,
             "boundary_alpha": alpha_b,
             "boundary_width": (
                 self.boundary_width(points_uv, boundary_width_raw)
