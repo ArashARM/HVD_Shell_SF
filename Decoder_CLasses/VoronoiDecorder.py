@@ -26,6 +26,9 @@ class VoronoiDecoder(nn.Module):
         n_seeds: int,
         eps: float = 1e-8,
         use_Metric_anisotropy: bool = True,
+        use_surface_metric: bool = True,
+        use_metric_voronoi_distance: bool = False,
+        normalize_metric_voronoi_distance: bool = True,
         use_band_weighted_fiber_pairs: bool = True,
         use_boundary_tangent_fibers: bool = True,
         fiber_band_prior_power: float = 2.0,
@@ -37,10 +40,11 @@ class VoronoiDecoder(nn.Module):
         # geometric strut half-width lower bound
         w_min: float = 0.05,
         w_max_ratio: float = 0.8,
+        width_cap_pair_quantile: float = 0.25,
 
 
         # density transition sharpness
-        beta: float = 0.02,
+        beta: float = 0.01,
         junction_beta_scale: float = 1.0,
         junction_width_bonus: float = 0.15,
 
@@ -119,6 +123,9 @@ class VoronoiDecoder(nn.Module):
         self.n_seeds = int(n_seeds)
         self.eps = float(eps)
         self.use_Metric_anisotropy = bool(use_Metric_anisotropy)
+        self.use_surface_metric = bool(use_surface_metric)
+        self.use_metric_voronoi_distance = bool(use_metric_voronoi_distance)
+        self.normalize_metric_voronoi_distance = bool(normalize_metric_voronoi_distance)
         self.use_band_weighted_fiber_pairs = bool(use_band_weighted_fiber_pairs)
         self.use_boundary_tangent_fibers = bool(use_boundary_tangent_fibers)
         self.fiber_band_prior_power = float(fiber_band_prior_power)
@@ -126,6 +133,7 @@ class VoronoiDecoder(nn.Module):
 
         self.w_min = float(w_min)
         self.w_max_ratio = float(w_max_ratio)
+        self.width_cap_pair_quantile = float(width_cap_pair_quantile)
         self.beta = float(beta)
         self.junction_beta_scale = float(junction_beta_scale)
         self.junction_width_bonus = float(junction_width_bonus)
@@ -545,13 +553,23 @@ class VoronoiDecoder(nn.Module):
                 return ones, active, empty, empty, empty, ones, ones
             u = seeds[:, 0]
             v = seeds[:, 1]
-            active = (u >= 0.0) & (u <= 1.0) & (v >= 0.0) & (v <= 1.0)
-            square_domain_weight = (
-                torch.sigmoid(u / temp)
-                * torch.sigmoid((1.0 - u) / temp)
-                * torch.sigmoid(v / temp)
-                * torch.sigmoid((1.0 - v) / temp)
+            outside_dist = torch.stack(
+                [
+                    -u,
+                    u - 1.0,
+                    -v,
+                    v - 1.0,
+                    torch.zeros_like(u),
+                ],
+                dim=0,
+            ).amax(dim=0)
+            inside_domain = outside_dist <= 0.0
+            square_domain_weight = torch.where(
+                inside_domain,
+                torch.ones_like(outside_dist),
+                torch.sigmoid(-outside_dist / temp.clamp_min(self.eps)),
             )
+            active = inside_domain
             uv_domain_weight, uv_domain_active, sdf_values, mask_values = self._seed_domain_validity_state(
                 seeds=seeds,
                 temp=domain_temp,
@@ -571,28 +589,6 @@ class VoronoiDecoder(nn.Module):
 
         dist = self._pairwise_seed_dist(seeds).to(device=seeds.device, dtype=seeds.dtype)
         radius = torch.as_tensor(self.duplicate_merge_sigma, device=seeds.device, dtype=seeds.dtype)
-        close = dist <= radius
-        close.fill_diagonal_(True)
-
-        close_cpu = close.detach().cpu().numpy()
-        visited = [False] * s
-        active_cpu = np.zeros((s,), dtype=bool)
-        for start in range(s):
-            if visited[start]:
-                continue
-            stack = [start]
-            component = []
-            visited[start] = True
-            while stack:
-                i = stack.pop()
-                component.append(i)
-                for j in np.nonzero(close_cpu[i])[0].tolist():
-                    if not visited[j]:
-                        visited[j] = True
-                        stack.append(int(j))
-            active_cpu[min(component)] = True
-
-        active = torch.as_tensor(active_cpu, device=seeds.device, dtype=torch.bool)
         temp = (radius * float(self.duplicate_effect_temp_ratio)).clamp_min(self.eps)
         soft_close = torch.sigmoid((radius - dist) / temp)
         soft_close = soft_close.masked_fill(torch.eye(s, dtype=torch.bool, device=seeds.device), 0.0)
@@ -605,15 +601,23 @@ class VoronoiDecoder(nn.Module):
         duplicate_weight = duplicate_floor + (1.0 - duplicate_floor) * raw_duplicate_weight
         u = seeds[:, 0]
         v = seeds[:, 1]
-        inside_domain = (u >= 0.0) & (u <= 1.0) & (v >= 0.0) & (v <= 1.0)
-        active = active & inside_domain
-
-        square_domain_weight = (
-            torch.sigmoid(u / temp)
-            * torch.sigmoid((1.0 - u) / temp)
-            * torch.sigmoid(v / temp)
-            * torch.sigmoid((1.0 - v) / temp)
+        outside_dist = torch.stack(
+            [
+                -u,
+                u - 1.0,
+                -v,
+                v - 1.0,
+                torch.zeros_like(u),
+            ],
+            dim=0,
+        ).amax(dim=0)
+        inside_domain = outside_dist <= 0.0
+        square_domain_weight = torch.where(
+            inside_domain,
+            torch.ones_like(outside_dist),
+            torch.sigmoid(-outside_dist / temp.clamp_min(self.eps)),
         )
+        active = inside_domain
         uv_domain_weight, uv_domain_active, sdf_values, mask_values = self._seed_domain_validity_state(
             seeds=seeds,
             temp=domain_temp,
@@ -673,13 +677,15 @@ class VoronoiDecoder(nn.Module):
             diagonal=1,
         )
         if bool(pair_mask.any()):
-            min_pair_dist = pair_dist[pair_mask].amin()
+            pair_dist_active = pair_dist[pair_mask]
+            q = min(max(self.width_cap_pair_quantile, 0.0), 1.0)
+            cap_pair_dist = torch.quantile(pair_dist_active, q)
             width_raw_global = w_raw[pair_mask].mean()
         else:
-            min_pair_dist = torch.zeros((), device=w_raw.device, dtype=w_raw.dtype)
+            cap_pair_dist = torch.zeros((), device=w_raw.device, dtype=w_raw.dtype)
             width_raw_global = w_raw.mean()
 
-        w_max = (self.w_max_ratio * min_pair_dist).clamp_min(self.w_min)
+        w_max = (self.w_max_ratio * cap_pair_dist).clamp_min(self.w_min)
         width_frac = 0.5 * (torch.tanh(width_raw_global / max(T, self.eps)) + 1.0)
         w_geo = self.w_min + (w_max - self.w_min) * width_frac
         return w_geo.expand_as(w_raw)
@@ -843,6 +849,86 @@ class VoronoiDecoder(nn.Module):
         diff[..., 1] = dv
         return diff
 
+    def _surface_metric_components(
+        self,
+        Xu: torch.Tensor,
+        Xv: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        E = (Xu * Xu).sum(dim=-1)
+        Fm = (Xu * Xv).sum(dim=-1)
+        Gm = (Xv * Xv).sum(dim=-1)
+        return E, Fm, Gm
+
+    def _point_seed_distance(
+        self,
+        points_uv: torch.Tensor,
+        seeds: torch.Tensor,
+        Xu: torch.Tensor | None = None,
+        Xv: torch.Tensor | None = None,
+        metric_aware: bool = False,
+        normalize_metric: bool = True,
+        eps: float = 1e-8,
+        points_face_id: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        diff = points_uv[:, None, :] - seeds[None, :, :]
+        diff = self._wrap_duv_points_to_seeds(diff, points_face_id)
+
+        if not metric_aware:
+            return torch.linalg.norm(diff, dim=-1)
+
+        if Xu is None or Xv is None:
+            raise ValueError("Xu and Xv are required when metric_aware=True")
+
+        E = (Xu * Xu).sum(dim=1)
+        Fm = (Xu * Xv).sum(dim=1)
+        Gm = (Xv * Xv).sum(dim=1)
+
+        du = diff[..., 0]
+        dv = diff[..., 1]
+
+        d2 = (
+            E[:, None] * du.pow(2)
+            + 2.0 * Fm[:, None] * du * dv
+            + Gm[:, None] * dv.pow(2)
+        )
+
+        d = torch.sqrt(d2.clamp_min(eps))
+
+        if normalize_metric:
+            local_scale = torch.sqrt(0.5 * (E + Gm)).clamp_min(eps)
+            scale = local_scale.mean().clamp_min(eps)
+            d = d / scale
+
+        return d
+
+    def _point_metric_matrix(
+        self,
+        Xu: torch.Tensor,
+        Xv: torch.Tensor,
+        normalize_metric: bool = True,
+        eps: float = 1e-8,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        E, Fm, Gm = self._surface_metric_components(Xu, Xv)
+
+        metric = torch.zeros(
+            Xu.shape[0],
+            2,
+            2,
+            device=Xu.device,
+            dtype=Xu.dtype,
+        )
+        metric[:, 0, 0] = E
+        metric[:, 0, 1] = Fm
+        metric[:, 1, 0] = Fm
+        metric[:, 1, 1] = Gm
+
+        local_scale = torch.sqrt(0.5 * (E + Gm)).clamp_min(eps)
+        scale = local_scale.mean().clamp_min(eps)
+        if normalize_metric:
+            metric = metric / scale.square().clamp_min(eps)
+
+        return metric, scale
+
     def _pairwise_uv_dirs(
         self,
         seeds: torch.Tensor,
@@ -940,19 +1026,21 @@ class VoronoiDecoder(nn.Module):
         q11 = Q[..., 1, 1]
         trace = q00 + q11
         diff = q00 - q11
-        gap = torch.sqrt(diff * diff + 4.0 * q01 * q01)
+        gap = torch.sqrt(diff * diff + 4.0 * q01 * q01 + self.eps)
         lambda_max = 0.5 * (trace + gap)
 
         v1 = torch.stack([q01, lambda_max - q00], dim=-1)
         v2 = torch.stack([lambda_max - q11, q01], dim=-1)
-        use_v1 = torch.norm(v1, dim=-1, keepdim=True) >= torch.norm(v2, dim=-1, keepdim=True)
+        v1_norm = torch.sqrt((v1 * v1).sum(dim=-1, keepdim=True) + self.eps)
+        v2_norm = torch.sqrt((v2 * v2).sum(dim=-1, keepdim=True) + self.eps)
+        use_v1 = v1_norm >= v2_norm
         t_uv = torch.where(use_v1, v1, v2)
 
         # Isotropic/zero tensors do not have a meaningful principal direction.
         fallback = torch.zeros_like(t_uv)
         fallback[..., 0] = 1.0
-        t_norm = torch.norm(t_uv, dim=-1, keepdim=True)
-        t_uv = torch.where(t_norm > self.eps, t_uv / t_norm.clamp_min(self.eps), fallback)
+        t_norm = torch.sqrt((t_uv * t_uv).sum(dim=-1, keepdim=True) + self.eps)
+        t_uv = t_uv / t_norm
         has_orientation = trace.reshape(*trace.shape, 1) > self.eps
         return torch.where(has_orientation, t_uv, torch.zeros_like(t_uv))
 
@@ -964,7 +1052,7 @@ class VoronoiDecoder(nn.Module):
         q11 = Q[..., 1, 1]
         trace = (q00 + q11).clamp_min(self.eps)
         diff = q00 - q11
-        gap = torch.sqrt(diff * diff + 4.0 * q01 * q01).clamp_min(0.0)
+        gap = torch.sqrt(diff * diff + 4.0 * q01 * q01 + self.eps)
         return (gap / trace).clamp(0.0, 1.0)
 
     def _blended_uv_fiber_axial(
@@ -1300,7 +1388,8 @@ class VoronoiDecoder(nn.Module):
         w_soft: torch.Tensor,          # (N, S), soft Voronoi weights w_ni
         w_geo: torch.Tensor,           # (S, S), geometric half-width w_ij
         beta: float | torch.Tensor,    # smoothness parameter beta
-        M: torch.Tensor,               # (S, 2, 2), metric matrices M_i
+        metric: torch.Tensor,          # (S, 2, 2) seed metric or (N, 2, 2) point metric
+        metric_mode: str,              # "seed" or "point"
         seed_active_weights: torch.Tensor | None = None,
         seed_duplicate_weights: torch.Tensor | None = None,
         seed_domain_weights: torch.Tensor | None = None,
@@ -1469,18 +1558,27 @@ class VoronoiDecoder(nn.Module):
         # so:
         #   grad d_i = (x - s_i) / d_i
 
-        if M.ndim != 3 or M.shape != (S, 2, 2):
-            raise ValueError(f"M must be (S, 2, 2), got {tuple(M.shape)}")
-
-        M = M.to(device=d.device, dtype=d.dtype)
-
         x_minus_s = points.unsqueeze(1) - seeds.unsqueeze(0)  # (N, S, 2)
 
-        grad_d = torch.einsum(
-            "sij,nsj->nsi",
-            M,
-            x_minus_s,
-        )
+        metric = metric.to(device=d.device, dtype=d.dtype)
+        if metric_mode == "seed":
+            if metric.ndim != 3 or metric.shape != (S, 2, 2):
+                raise ValueError(f"seed metric must be (S, 2, 2), got {tuple(metric.shape)}")
+            grad_d = torch.einsum(
+                "sij,nsj->nsi",
+                metric,
+                x_minus_s,
+            )
+        elif metric_mode == "point":
+            if metric.ndim != 3 or metric.shape != (N, 2, 2):
+                raise ValueError(f"point metric must be (N, 2, 2), got {tuple(metric.shape)}")
+            grad_d = torch.einsum(
+                "nij,nsj->nsi",
+                metric,
+                x_minus_s,
+            )
+        else:
+            raise ValueError(f"metric_mode must be 'seed' or 'point', got {metric_mode!r}")
 
         grad_d = grad_d / d.unsqueeze(2).clamp_min(self.eps)
 
@@ -1488,20 +1586,19 @@ class VoronoiDecoder(nn.Module):
         grad_norm = torch.sqrt((grad_vec * grad_vec).sum(dim=-1) + self.eps)
 
         true_dist = abs_delta / grad_norm.clamp_min(self.eps)
+        #true_dist =abs_delta
 
         pair_tangent_ij = torch.stack(
             [-grad_vec[..., 1], grad_vec[..., 0]],
             dim=-1,
         )
-        pair_tangent_ij = pair_tangent_ij / torch.norm(
-            pair_tangent_ij,
-            dim=-1,
-            keepdim=True,
-        ).clamp_min(self.eps)
+        pair_tangent_norm = torch.sqrt(
+            (pair_tangent_ij * pair_tangent_ij).sum(dim=-1, keepdim=True) + self.eps
+        )
+        pair_tangent_ij = pair_tangent_ij / pair_tangent_norm
 
-        beta_t = torch.as_tensor(beta, device=d.device, dtype=d.dtype)
-        beta_eff = beta_t
-        w_geo_eff = w_geo
+        beta_eff = torch.as_tensor(beta, device=d.device, dtype=d.dtype)
+        w_geo_eff = w_geo.unsqueeze(0).to(device=d.device, dtype=d.dtype)
 
         # ==================================================
         # 5. Pair distinctness
@@ -1553,6 +1650,28 @@ class VoronoiDecoder(nn.Module):
         #
         # w_geo:
         #   controls strut half-width.
+
+
+                # --------------------------------------------------
+        # 4. Ambiguity / junction information
+        # --------------------------------------------------
+        ambiguity = (1.0 - w_struct.pow(2).sum(dim=1)).clamp(0.0, 1.0)
+
+        beta_t = torch.as_tensor(beta, device=d.device, dtype=d.dtype)
+
+        # Start clean: do NOT widen bands using ambiguity yet
+        beta_eff = beta_t
+        w_geo_eff = w_geo
+
+        # Later, after geometry looks good, you may restore:
+        #
+        beta_eff = beta_t * (
+            1.0 + self.junction_beta_scale * ambiguity.unsqueeze(1).unsqueeze(2)
+        )
+        
+        w_geo_eff = w_geo * (
+            1.0 + self.junction_width_bonus * ambiguity.unsqueeze(1).unsqueeze(2)
+        )
 
         band_raw = torch.sigmoid(
             (w_geo_eff - true_dist) / (beta_eff + self.eps)
@@ -1639,19 +1758,21 @@ class VoronoiDecoder(nn.Module):
         #   S_nij =
         #   B_nij * P_nij^p * G_nij * J_n
 
-        pair_power = 0.3
-        pair_threshold = 0.03
+        pair_power = 0.8
+        pair_threshold = 0.1
         pair_softness = 0.01
 
         pair_gate = torch.sigmoid(
             (pair_prod - pair_threshold) / pair_softness
         )
+   
+        pair_gate=1
 
         pair_strength = (
             band_ij
             * pair_prod.clamp_min(self.eps).pow(pair_power)
             * pair_gate
-            * junction_boost[:, None, None]
+            #* junction_boost[:, None, None]
         )
 
         pair_relevance = None
@@ -1693,9 +1814,13 @@ class VoronoiDecoder(nn.Module):
         # Role:
         #   Combines all pair bands into one bounded density field.
         #   Density saturates smoothly into [0, 1].
+        R_pair = pair_strength.sum(dim=(1, 2))
+
+        R_junction = self._triple_junction_score(w_struct)
+
 
         R_pair = pair_strength.sum(dim=(1, 2))
-        R = R_pair
+        R = R_pair + self.junction_triple_lambda * R_junction * global_activity
 
         rho = 1.0 - torch.exp(-self.alpha_union * R)
         rho = rho * global_activity
@@ -1758,7 +1883,11 @@ class VoronoiDecoder(nn.Module):
             )
         if not (tau > 0.0):
             raise ValueError(f"tau must be > 0, got {tau}")
-        if self.use_Metric_anisotropy:
+        if (
+            self.use_Metric_anisotropy
+            and not self.use_surface_metric
+            and not self.use_metric_voronoi_distance
+        ):
             if theta is None or a_raw is None:
                 raise ValueError("use_Metric_anisotropy=True requires theta and a_raw.")
             if theta.shape != (self.n_seeds,) or a_raw.shape != (self.n_seeds,):
@@ -1794,7 +1923,7 @@ class VoronoiDecoder(nn.Module):
         point_domain_mask: torch.Tensor | Callable[[torch.Tensor], torch.Tensor] | None = None,
         point_domain_mask_threshold: float | None = None,
         point_domain_temp: float | torch.Tensor | None = None,
-    ) -> dict[str, torch.Tensor]:
+    ) -> dict[str, Any]:
         self._validate_inputs(
             points_uv=points_uv,
             Xu=Xu,
@@ -1809,17 +1938,84 @@ class VoronoiDecoder(nn.Module):
         seeds = self.seeds_uv(seeds_raw)
         S = seeds.shape[0]
 
-        if self.use_Metric_anisotropy:
-            M = self.metric_matrices(theta, a_raw)
-        else:
-            I = torch.eye(2, device=points_uv.device, dtype=points_uv.dtype)
-            M = I.unsqueeze(0).expand(S, 2, 2)
-
         diff = points_uv.unsqueeze(1) - seeds.unsqueeze(0)
         diff = self._wrap_duv_points_to_seeds(diff, points_face_id)
+        d_uv = self._point_seed_distance(
+            points_uv=points_uv,
+            seeds=seeds,
+            metric_aware=False,
+            eps=self.eps,
+            points_face_id=points_face_id,
+        )
+        d_metric = self._point_seed_distance(
+            points_uv=points_uv,
+            seeds=seeds,
+            Xu=Xu,
+            Xv=Xv,
+            metric_aware=True,
+            normalize_metric=self.normalize_metric_voronoi_distance,
+            eps=self.eps,
+            points_face_id=points_face_id,
+        )
+        metric_voronoi_G, metric_voronoi_scale = self._point_metric_matrix(
+            Xu=Xu,
+            Xv=Xv,
+            normalize_metric=self.normalize_metric_voronoi_distance,
+            eps=self.eps,
+        )
 
-        d2 = torch.einsum("nsi,sij,nsj->ns", diff, M, diff)
-        d = torch.sqrt(d2.clamp_min(self.eps))
+        I = torch.eye(2, device=points_uv.device, dtype=points_uv.dtype)
+        if self.use_metric_voronoi_distance:
+            d = d_metric
+            metric_for_bisector = metric_voronoi_G
+            metric_mode = "point"
+
+            # Kept for backward-compatible debug output; geometry uses metric_voronoi_G.
+            M = I.unsqueeze(0).expand(S, 2, 2)
+            G = metric_voronoi_G
+        elif self.use_surface_metric:
+            g00 = (Xu * Xu).sum(dim=1)
+            g01 = (Xu * Xv).sum(dim=1)
+            g11 = (Xv * Xv).sum(dim=1)
+
+            G = torch.zeros(
+                points_uv.shape[0],
+                2,
+                2,
+                device=points_uv.device,
+                dtype=points_uv.dtype,
+            )
+            G[:, 0, 0] = g00
+            G[:, 0, 1] = g01
+            G[:, 1, 0] = g01
+            G[:, 1, 1] = g11
+            detG = (
+                G[:, 0, 0] * G[:, 1, 1]
+                - G[:, 0, 1] * G[:, 1, 0]
+            ).clamp_min(self.eps)
+            scale = torch.sqrt(detG)
+            G = G / scale[:, None, None].clamp_min(self.eps)
+            I2 = torch.eye(2, device=points_uv.device, dtype=points_uv.dtype)
+            G = G + self.eps * I2.unsqueeze(0)
+
+            d2 = torch.einsum("nsi,nij,nsj->ns", diff, G, diff)
+            d = torch.sqrt(d2.clamp_min(self.eps))
+            metric_for_bisector = G
+            metric_mode = "point"
+
+            # Kept for backward-compatible debug output; geometry uses G.
+            M = I.unsqueeze(0).expand(S, 2, 2)
+        else:
+            G = torch.empty(0, 2, 2, device=points_uv.device, dtype=points_uv.dtype)
+            if self.use_Metric_anisotropy:
+                M = self.metric_matrices(theta, a_raw)
+            else:
+                M = I.unsqueeze(0).expand(S, 2, 2)
+
+            d2 = torch.einsum("nsi,sij,nsj->ns", diff, M, diff)
+            d = torch.sqrt(d2.clamp_min(self.eps))
+            metric_for_bisector = M
+            metric_mode = "seed"
 
         if points_face_id is not None:
             if points_face_id.dtype != torch.long:
@@ -1885,7 +2081,7 @@ class VoronoiDecoder(nn.Module):
 
         seeds_eval = seeds
         d_eval = d
-        M_eval = M
+        metric_for_bisector_eval = metric_for_bisector
         w_raw_eval = w_raw
         seed_active_weights_eval = seed_active_weights
         seed_duplicate_weights_eval = seed_duplicate_weights
@@ -1898,7 +2094,10 @@ class VoronoiDecoder(nn.Module):
             active_idx = torch.nonzero(seed_active_mask, as_tuple=False).flatten()
             seeds_eval = seeds.index_select(0, active_idx)
             d_eval = d.index_select(1, active_idx)
-            M_eval = M.index_select(0, active_idx)
+            if metric_mode == "seed":
+                metric_for_bisector_eval = metric_for_bisector.index_select(0, active_idx)
+            else:
+                metric_for_bisector_eval = metric_for_bisector
             w_raw_eval = w_raw.index_select(0, active_idx).index_select(1, active_idx)
             seed_active_weights_eval = seed_active_weights.index_select(0, active_idx)
             seed_duplicate_weights_eval = seed_duplicate_weights.index_select(0, active_idx)
@@ -1937,7 +2136,8 @@ class VoronoiDecoder(nn.Module):
             w_soft=w_soft,
             w_geo=w_geo,
             beta=self.beta,
-            M=M_eval,
+            metric=metric_for_bisector_eval,
+            metric_mode=metric_mode,
             seed_active_weights=seed_active_weights_eval,
             seed_duplicate_weights=seed_duplicate_weights_eval,
             seed_domain_weights=seed_domain_activity_weights_eval,
@@ -2023,14 +2223,22 @@ class VoronoiDecoder(nn.Module):
         m = torch.sigmoid((rho - rho0) / gamma).unsqueeze(1)
         fiber_strength = m.squeeze(1)
 
-        t_uv = t_uv_raw * m
+        fallback_uv = torch.zeros_like(t_uv_raw)
+        fallback_uv[:, 0] = 1.0
+        t_uv_norm = torch.linalg.norm(t_uv_raw, dim=1, keepdim=True)
+        t_uv = torch.where(t_uv_norm > self.eps, t_uv_raw, fallback_uv)
         fiber3d = self.map_to_3d(t_uv, Xu=Xu, Xv=Xv)
         h = self.height(h_raw, ref_tensor=points_uv)
 
         return {
             "w_soft": w_soft,
             "d": d,
+            "d_uv_mean": d_uv.mean(),
+            "d_metric_mean": d_metric.mean(),
+            "d_metric_scale_mean": metric_voronoi_scale,
             "M": M,
+            "surface_metric_G": G,
+            "metric_mode": metric_mode,
             "seeds": seeds,
             "seed_active_weights": seed_active_weights,
             "seed_active_mask": seed_active_mask,
@@ -2194,6 +2402,9 @@ class VoronoiModelVisualizer:
         point_domain_temp=None,
         eps: float = 1e-8,
         use_metric_anisotropy: bool = False,
+        use_surface_metric: bool = False,
+        use_metric_voronoi_distance: bool = False,
+        normalize_metric_voronoi_distance: bool = True,
         w_min: float = 0.005,
         fixed_height: float | None = None,
         use_boundary_attachment: bool = False,
@@ -2260,6 +2471,9 @@ class VoronoiModelVisualizer:
             n_seeds=self.n_seeds,
             eps=eps,
             use_Metric_anisotropy=use_metric_anisotropy,
+            use_surface_metric=use_surface_metric,
+            use_metric_voronoi_distance=use_metric_voronoi_distance,
+            normalize_metric_voronoi_distance=normalize_metric_voronoi_distance,
             w_min=w_min,
             fixed_height=fixed_height,
             use_boundary_attachment=use_boundary_attachment,

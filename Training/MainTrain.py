@@ -15,7 +15,11 @@ from torch.utils.tensorboard import SummaryWriter
 from Utils.TimelapseRecorder import TimelapseRecorder
 from tqdm.auto import tqdm
 import numpy as np
-from scipy.interpolate import griddata
+from Utils.DifferentiableFilters import (
+    build_mesh_edges,
+    smooth_heaviside_projection,
+    surface_density_filter_metric_aware,
+)
 
 import pyvista as pv
 try:
@@ -86,21 +90,33 @@ def compute_w_min_from_min_feature_size_3d(
 
     return float(w_min_uv.detach().cpu())
 
-
 @dataclass
 class TrainingConfig:
+    seed_init_fps_seed : int | None = None
     seed_number: int = 15
     training_face_index: int = 0
     LoadingCasee: str = "Unspecified loading case"
     use_Metric_anisotropy: bool = True
+    use_metric_voronoi_distance: bool = False
+    normalize_metric_voronoi_distance: bool = True
     fixed_height: float | None = None
     target_volfrac: float = 0.5
     seed_repulsion_sigma: float = 0.08
     boundary_margin: float = 0.05
     freeze_w: bool = False
-    use_boundary_attachment: bool = True
+    use_boundary_attachment: bool = False
     boundary_volume_assist: float = 0.10
     w_const: float = 0.25
+
+    use_3d_density_filter: bool = False
+    filter_radius_3d: float = 0.03
+    filter_self_weight: float = 1.0
+    filter_projection_strength: float = 1.0
+    filter_projection_beta: float = 8.0
+    filter_projection_eta: float = 0.5
+    visualize_filtered_density: bool = True
+    visualize_raw_density: bool = False
+
 
     # boundary defaults / fallback values used by decoder if PPNet does not predict them
     boundary_attach_width: float = 0.03
@@ -114,7 +130,6 @@ class TrainingConfig:
 
     boundary_attach_width_min: float = 0.005
     boundary_attach_width_max: float = 0.10
-    duplicate_merge_sigma:float = 0.05
     seed_activity_sharpness: float = 3.0
     seed_activity_threshold: float = 0.5
 
@@ -133,7 +148,7 @@ class TrainingConfig:
 
     lam_fem: float = 1.0
     lam_vol: float = 2.0
-    lam_rep: float = 0.5
+    lam_rep: float = 2.0
     lam_bnd: float = 0.5
 
     lam_strut: float = 0.02
@@ -146,7 +161,6 @@ class TrainingConfig:
     width_target_frac_max: float = 0.85
     width_warmup_start_frac: float = 0.50
     width_warmup_ramp_frac: float = 0.20
-    lam_width_active_hard_multiplier: float = 8.0
     decoder_raw_temp: float = 1.25
     use_band_weighted_fiber_pairs: bool = True
     fiber_band_prior_power: float = 2.0
@@ -169,9 +183,6 @@ class TrainingConfig:
     tau_anneal_start_frac: float = 0.0
     tau_anneal_ramp_frac: float = 0.5
     beta: float = 0.05
-    density_projection_strength: float = 0.0
-    density_projection_threshold: float = 0.5
-    density_projection_gamma: float = 0.05
     seed_anchor_momentum: float = 0.20
     seed_anchor_warmup_frac: float = 0.05
     use_rolling_seed_anchors: bool = True
@@ -249,8 +260,6 @@ class TrainingConfig:
     timelapse_output_folder: str | None = None
 
     timelapse_frame_step: int = 20
-    TM_laps_res_u: int = 100
-    TM_laps_res_v: int = 100
     TM_laps_Thr: float = 0.45
 
     def __post_init__(self):
@@ -299,14 +308,19 @@ class TrainingConfig:
             )
         if self.tau_anneal_final is not None and self.tau_anneal_final <= 0.0:
             raise ValueError(f"tau_anneal_final must be > 0, got {self.tau_anneal_final}")
-        if not (0.0 <= self.density_projection_strength <= 1.0):
+        if not (0.0 <= self.filter_projection_strength <= 1.0):
             raise ValueError(
-                "density_projection_strength must be in [0,1], "
-                f"got {self.density_projection_strength}"
+                "filter_projection_strength must be in [0,1], "
+                f"got {self.filter_projection_strength}"
             )
-        if self.density_projection_gamma <= 0.0:
+        if self.filter_projection_beta <= 0.0:
             raise ValueError(
-                f"density_projection_gamma must be > 0, got {self.density_projection_gamma}"
+                f"filter_projection_beta must be > 0, got {self.filter_projection_beta}"
+            )
+        if not (0.0 < self.filter_projection_eta < 1.0):
+            raise ValueError(
+                "filter_projection_eta must be in (0,1), "
+                f"got {self.filter_projection_eta}"
             )
         if not (0.0 <= self.seed_anchor_momentum <= 1.0):
             raise ValueError(
@@ -395,6 +409,121 @@ class TrainingConfig:
                 raise ValueError(
                     f"min_feature_size_3d must be > 0, got {self.min_feature_size_3d}"
                 )
+
+
+def _cfg_value(config, name: str, default=None):
+    if isinstance(config, dict):
+        return config.get(name, default)
+    return getattr(config, name, default)
+
+
+def _density_postprocess_debug(
+    rho_raw: torch.Tensor,
+    rho_filtered: torch.Tensor,
+    rho_projected: torch.Tensor,
+    rho_final: torch.Tensor,
+) -> dict[str, float]:
+    filter_delta = (rho_filtered - rho_raw).abs()
+    projection_delta = (rho_projected - rho_filtered).abs()
+    return {
+        "filter_delta_mean": float(filter_delta.detach().mean().item()),
+        "filter_delta_max": float(filter_delta.detach().max().item()),
+        "projection_delta_mean": float(projection_delta.detach().mean().item()),
+        "projection_delta_max": float(projection_delta.detach().max().item()),
+        "raw_mean": float(rho_raw.detach().mean().item()),
+        "filtered_mean": float(rho_filtered.detach().mean().item()),
+        "projected_mean": float(rho_projected.detach().mean().item()),
+        "final_mean": float(rho_final.detach().mean().item()),
+    }
+
+
+def apply_density_postprocess(
+    rho,
+    face_tensor,
+    config,
+    return_debug: bool = False,
+):
+    """
+    Canonical decoder-density postprocess.
+
+    The 3D filter is graph-based, so callers must pass a face_tensor whose
+    points/faces correspond to the density samples in `rho`.
+    """
+    rho_raw = rho
+    eps = float(_cfg_value(config, "eps", 1e-8))
+
+    use_density_filter = bool(_cfg_value(config, "use_3d_density_filter", False))
+    if use_density_filter:
+        rho_filtered = surface_density_filter_metric_aware(
+            rho=rho_raw,
+            points_xyz=face_tensor["points_xyz"],
+            faces=face_tensor["faces_ijk"],
+            Xu=face_tensor["Xu"],
+            Xv=face_tensor["Xv"],
+            base_radius=float(_cfg_value(config, "filter_radius_3d", 0.03)),
+            self_weight=float(_cfg_value(config, "filter_self_weight", 1.0)),
+            eps=eps,
+        )
+    else:
+        rho_filtered = rho_raw
+
+    projection_strength = float(_cfg_value(config, "filter_projection_strength", 0.0))
+    if use_density_filter and projection_strength > 0.0:
+        rho_projected = smooth_heaviside_projection(
+            rho_filtered,
+            beta=float(_cfg_value(config, "filter_projection_beta", 8.0)),
+            eta=float(_cfg_value(config, "filter_projection_eta", 0.5)),
+            strength=projection_strength,
+            eps=eps,
+            debug=False,
+        )
+    else:
+        rho_projected = rho_filtered
+
+    rho_final = rho_projected
+    if not return_debug:
+        return rho_final
+    return rho_final, _density_postprocess_debug(
+        rho_raw=rho_raw,
+        rho_filtered=rho_filtered,
+        rho_projected=rho_projected,
+        rho_final=rho_final,
+    )
+
+
+def apply_density_postprocess_to_output(
+    out: dict,
+    face_tensor,
+    config,
+    return_debug: bool = False,
+):
+    rho_raw = out["rho"]
+    rho_final, stats = apply_density_postprocess(
+        rho_raw,
+        face_tensor,
+        config,
+        return_debug=True,
+    )
+
+    out["rho_raw_decoder"] = rho_raw
+    if "rho_s" in out:
+        out["rho_s_raw_decoder"] = out["rho_s"]
+    if "rho_v" in out:
+        out["rho_v_raw_decoder"] = out["rho_v"]
+    out["rho"] = rho_final
+    out["density"] = rho_final
+    out["rho_postprocessed"] = rho_final
+    if "rho_s" in out:
+        out["rho_s"] = rho_final
+        out["rho_s_postprocessed"] = rho_final
+    if "rho_v" in out:
+        out["rho_v"] = rho_final
+        out["rho_v_postprocessed"] = rho_final
+    if return_debug:
+        out["density_postprocess_stats"] = stats
+        return out, stats
+    return out
+
 
 class RunningNorm:
     def __init__(self, momentum: float = 0.99, eps: float = 1e-12):
@@ -636,6 +765,8 @@ class OptimizedShellFunction:
             tau = float(self.config.get("tau", 0.02))
 
         with torch.no_grad():
+            # Raw arbitrary-point evaluation: graph density postprocess needs a
+            # full mesh/face tensor and is applied by evaluate_face().
             return self.decoder.evaluate_at_uv(
                 points_uv=points_uv,
                 Xu=Xu,
@@ -659,12 +790,23 @@ class OptimizedShellFunction:
             )
 
     def evaluate_face(self, face_tensor, hard_seed_mask=True):
-        return self.evaluate_at_uv(
+        ft = _tree_to_device(
+            dict(face_tensor),
+            device=self.device,
+            dtype=face_tensor["uv"].dtype if torch.is_tensor(face_tensor["uv"]) else None,
+        )
+        out = self.evaluate_at_uv(
             points_uv=face_tensor["uv"],
             Xu=face_tensor["Xu"],
             Xv=face_tensor["Xv"],
-            face_tensor=face_tensor,
+            face_tensor=ft,
             hard_seed_mask=hard_seed_mask,
+        )
+        return apply_density_postprocess_to_output(
+            out,
+            ft,
+            self.config,
+            return_debug=False,
         )
 
     def build_fem_fields(self, shell_problem, face_tensor, rho_void=1e-3, hard_seed_mask=True):
@@ -703,18 +845,58 @@ def evaluate_optimized_shell_function(
     density = out["rho"]
     fiber_2d = out.get("t_uv", out.get("t_uv_raw", None))
     fiber_3d = out["fiber3d"]
+    rho_raw_decoder = out.get("rho_raw_decoder", density)
+    density_binary = (density >= 0.5).to(dtype=density.dtype)
     return {
         "2d_density": density,
         "2d_fiberDir": fiber_2d,
         "3d_density": density,
         "3d_fiberDir": fiber_3d,
         "density": density,
+        "density_binary": density_binary,
         "fiber_direction": fiber_3d,
         "rho": density,
+        "rho_raw_decoder": rho_raw_decoder,
+        "rho_postprocessed": out.get("rho_postprocessed", density),
         "fiber3d": fiber_3d,
         "t_uv": fiber_2d,
         "decoder_output": out,
         "face_tensor": face_tensor,
+    }
+
+
+def sanity_check_density_postprocess_pipeline(
+    optimized_function,
+    face_tensor,
+    expected_training_rho=None,
+    tol: float = 1e-6,
+    small_tolerance: float = 1e-8,
+):
+    out = optimized_function.evaluate_face(face_tensor)
+    rho = out["rho"]
+    rho_raw = out.get("rho_raw_decoder", rho)
+    cfg = optimized_function.config
+    postprocess_enabled = bool(cfg.get("use_3d_density_filter", False))
+    if postprocess_enabled:
+        delta = (rho - rho_raw).abs().mean()
+        assert float(delta.detach().item()) > float(small_tolerance), (
+            "Postprocess is enabled but evaluate_face returned density too close "
+            "to rho_raw_decoder."
+        )
+    fields = evaluate_optimized_shell_function(optimized_function, face_tensor)
+    assert fields["rho"] is out["rho"] or torch.allclose(fields["rho"], out["rho"], atol=tol, rtol=0.0)
+    assert fields["density"] is fields["rho"] or torch.allclose(fields["density"], fields["rho"], atol=tol, rtol=0.0)
+    assert "rho_raw_decoder" in fields
+    if expected_training_rho is not None:
+        expected = torch.as_tensor(expected_training_rho, device=rho.device, dtype=rho.dtype)
+        assert torch.allclose(rho, expected, atol=tol, rtol=0.0), (
+            "Loaded optimized_shell_function.evaluate_face(...) does not match "
+            "the expected training-time postprocessed density."
+        )
+    return {
+        "mean_abs_postprocess_delta": float((rho - rho_raw).abs().mean().detach().item()),
+        "rho_mean": float(rho.detach().mean().item()),
+        "rho_raw_mean": float(rho_raw.detach().mean().item()),
     }
 
 
@@ -1237,6 +1419,77 @@ class NN_Trainer:
 
         return bidx[keep]
 
+    def _ordered_true_open_boundary(self, ft):
+        bidx = self._true_open_boundary_idx(ft)
+        if bidx.numel() == 0 or ft.get("faces_ijk", None) is None:
+            return bidx, None
+
+        device = bidx.device
+        boundary_set = set(int(i) for i in bidx.detach().cpu().tolist())
+        if len(boundary_set) < 2:
+            return bidx, None
+
+        faces = ft["faces_ijk"].detach().cpu().to(torch.long)
+        edge_count = {}
+        for a, b, c in faces.tolist():
+            for i, j in ((a, b), (b, c), (c, a)):
+                key = (i, j) if i < j else (j, i)
+                edge_count[key] = edge_count.get(key, 0) + 1
+
+        adj = {i: [] for i in boundary_set}
+        for (i, j), count in edge_count.items():
+            if count == 1 and i in boundary_set and j in boundary_set:
+                adj[i].append(j)
+                adj[j].append(i)
+
+        if not any(adj.values()):
+            return bidx, None
+
+        ordered = []
+        loop_ids = []
+        visited_edges = set()
+
+        def edge_key(i, j):
+            return (i, j) if i < j else (j, i)
+
+        starts = [i for i, nbrs in adj.items() if len(nbrs) == 1]
+        starts.extend(i for i in adj.keys() if i not in starts)
+
+        loop_id = 0
+        for start in starts:
+            has_unused = any(edge_key(start, nb) not in visited_edges for nb in adj[start])
+            if not has_unused:
+                continue
+
+            chain = [start]
+            prev = None
+            cur = start
+            while True:
+                next_nodes = [
+                    nb for nb in adj[cur]
+                    if nb != prev and edge_key(cur, nb) not in visited_edges
+                ]
+                if not next_nodes:
+                    break
+                nxt = next_nodes[0]
+                visited_edges.add(edge_key(cur, nxt))
+                if nxt == start:
+                    break
+                chain.append(nxt)
+                prev, cur = cur, nxt
+
+            if len(chain) >= 2:
+                ordered.extend(chain)
+                loop_ids.extend([loop_id] * len(chain))
+                loop_id += 1
+
+        if not ordered:
+            return bidx, None
+
+        ordered_idx = torch.tensor(ordered, dtype=torch.long, device=device)
+        loop_id_t = torch.tensor(loop_ids, dtype=torch.long, device=device)
+        return ordered_idx, loop_id_t
+
     @staticmethod
     def _to_float_if_finite(x):
         if isinstance(x, torch.Tensor):
@@ -1268,23 +1521,6 @@ class NN_Trainer:
         except Exception:
             pass
 
-    def _soft_project_density(self, rho: torch.Tensor) -> torch.Tensor:
-        strength = float(self.cfg.density_projection_strength)
-        if strength <= 0.0:
-            return rho
-
-        threshold = torch.as_tensor(
-            self.cfg.density_projection_threshold,
-            device=rho.device,
-            dtype=rho.dtype,
-        )
-        gamma = torch.as_tensor(
-            self.cfg.density_projection_gamma,
-            device=rho.device,
-            dtype=rho.dtype,
-        ).clamp_min(self.cfg.eps)
-        rho_proj = torch.sigmoid((rho - threshold) / gamma)
-        return ((1.0 - strength) * rho + strength * rho_proj).clamp(0.0, 1.0)
 
     def _tb_log_step(
         self,
@@ -1350,6 +1586,9 @@ class NN_Trainer:
 
         self._tb_add_scalar("Metric/ThetaMean", row["theta_mean"], step)
         self._tb_add_scalar("Metric/AMean", row["a_metric_mean"], step)
+        self._tb_add_scalar("VoronoiDistance/UVMean", row["d_uv_mean"], step)
+        self._tb_add_scalar("VoronoiDistance/MetricMean", row["d_metric_mean"], step)
+        self._tb_add_scalar("VoronoiDistance/MetricScaleMean", row["d_metric_scale_mean"], step)
         self._tb_add_scalar("Train/Tau", row["tau"], step)
 
         self._tb_add_scalar("seed_activation/active_count_total", row["active_count_total"], step)
@@ -2191,7 +2430,6 @@ class NN_Trainer:
         self,
         device,
         seed_number,
-        boundary_idx_ring1,
         u_periodic,
         v_periodic,
     ):
@@ -2199,7 +2437,6 @@ class NN_Trainer:
             **self._decoder_init_kwargs(
                 device=device,
                 seed_number=seed_number,
-                boundary_idx_ring1=boundary_idx_ring1,
                 u_periodic=u_periodic,
                 v_periodic=v_periodic,
             )
@@ -2236,29 +2473,22 @@ class NN_Trainer:
 
         return decoder, ppnet
 
-    def _decoder_init_kwargs(self, device, seed_number, u_periodic, v_periodic, boundary_idx_ring1=None):
+    def _decoder_init_kwargs(self, device, seed_number, u_periodic, v_periodic):
         face_u_periodic = torch.tensor([bool(u_periodic)], dtype=torch.bool, device=device)
         face_v_periodic = torch.tensor([bool(v_periodic)], dtype=torch.bool, device=device)
         seed_face_id = torch.zeros(seed_number, dtype=torch.long, device=device)
-        if boundary_idx_ring1 is None:
-            boundary_solid_idx = torch.empty(0, dtype=torch.long, device=device)
-        else:
-            boundary_solid_idx = torch.as_tensor(boundary_idx_ring1, dtype=torch.long, device=device)
 
         return {
             "n_seeds": int(seed_number),
             "use_Metric_anisotropy": self.cfg.use_Metric_anisotropy,
-            "boundary_solid_idx": boundary_solid_idx,
+            "use_metric_voronoi_distance": self.cfg.use_metric_voronoi_distance,
+            "normalize_metric_voronoi_distance": self.cfg.normalize_metric_voronoi_distance,
             "seed_face_id": seed_face_id,
             "face_u_periodic": face_u_periodic,
             "face_v_periodic": face_v_periodic,
             "w_min": self.cfg.w_min,
             "w_max_ratio": self.cfg.w_max_ratio,
             "beta": self.cfg.beta,
-            "density_projection_strength": self.cfg.density_projection_strength,
-            "density_projection_threshold": self.cfg.density_projection_threshold,
-            "density_projection_gamma": self.cfg.density_projection_gamma,
-            "duplicate_merge_sigma": self.cfg.duplicate_merge_sigma,
             "seed_activity_sharpness": self.cfg.seed_activity_sharpness,
             "seed_activity_threshold": self.cfg.seed_activity_threshold,
             "raw_temp": self.cfg.decoder_raw_temp,
@@ -2282,7 +2512,6 @@ class NN_Trainer:
         return self._build_single_face_models(
             device=device,
             seed_number=self.cfg.seed_number,
-            boundary_idx_ring1=face_tensor["boundary_idx_ring1"],
             u_periodic=face_tensor.get("u_periodic", False),
             v_periodic=face_tensor.get("v_periodic", False),
         )
@@ -2326,7 +2555,6 @@ class NN_Trainer:
                 self._decoder_init_kwargs(
                     device=device,
                     seed_number=int(getattr(decoder, "n_seeds", self.cfg.seed_number)),
-                    boundary_idx_ring1=face_tensor.get("boundary_idx_ring1", None),
                     u_periodic=face_tensor.get("u_periodic", False),
                     v_periodic=face_tensor.get("v_periodic", False),
                 )
@@ -2529,40 +2757,6 @@ class NN_Trainer:
             return t.reshape(-1)
         return vals.reshape(-1)
     
-    def _collect_decoder_param_logs(self, decoder, pred_i: dict, ref_tensor: torch.Tensor) -> dict:
-        out = {}
-
-        if "w_raw" in pred_i and pred_i["w_raw"] is not None:
-            w_geo = decoder.width(pred_i["w_raw"], seeds=pred_i["seeds_raw"])
-            out["w_geo"] = self._pair_upper_values(w_geo).mean().reshape(())
-
-        if "h_raw" in pred_i and pred_i["h_raw"] is not None:
-            out["h"] = decoder.height(pred_i["h_raw"], ref_tensor=ref_tensor).reshape(())
-
-        if "boundary_width_raw" in pred_i and pred_i["boundary_width_raw"] is not None:
-            out["boundary_width"] = decoder.boundary_width(
-                ref_tensor, pred_i["boundary_width_raw"]
-            ).reshape(())
-
-        if "boundary_alpha_raw" in pred_i and pred_i["boundary_alpha_raw"] is not None:
-            out["boundary_alpha"] = decoder.boundary_alpha(
-                ref_tensor, pred_i["boundary_alpha_raw"]
-            ).reshape(())
-
-        if "boundary_beta_raw" in pred_i and pred_i["boundary_beta_raw"] is not None:
-            out["boundary_beta"] = decoder.boundary_beta(
-                ref_tensor, pred_i["boundary_beta_raw"]
-            ).reshape(())
-
-        if "a_raw" in pred_i and pred_i["a_raw"] is not None:
-            a = 0.5 * (2.0 - 0.5) * torch.tanh(pred_i["a_raw"]) + 0.5 * (2.0 + 0.5)
-            out["a_metric"] = a.mean().reshape(())
-
-        if "theta" in pred_i and pred_i["theta"] is not None:
-            out["theta_mean"] = pred_i["theta"].mean().reshape(())
-
-        return out
-    
     def _init_face_seed(self, face_tensor):
         cfg = self.cfg
         boundary = self._true_open_boundary_idx(face_tensor)
@@ -2570,6 +2764,7 @@ class NN_Trainer:
             face_tensor["points_xyz"],
             cfg.seed_number,
             exclude_idx=boundary,
+            seed = cfg.seed_init_fps_seed,
         )
         return face_tensor["uv"][seed_idx].clone()
 
@@ -2795,13 +2990,6 @@ class NN_Trainer:
             )
         return [selected]
 
-    def _safe_weighted_mean(self, values, weights, dtype, device, eps):
-        if len(values) == 0:
-            return torch.zeros((), dtype=dtype, device=device)
-        v = torch.stack(values)
-        w = torch.stack(weights).to(dtype=v.dtype, device=v.device)
-        return (v * w).sum() / w.sum().clamp_min(eps)
-
     @staticmethod
     def _build_face_uv_grid(ft, grid_res_u, grid_res_v):
         uv_face = ft["uv"]
@@ -2942,47 +3130,6 @@ class NN_Trainer:
         ft["_seed_domain_mask_callable"] = mask_fn
         return mask_fn
 
-    @staticmethod
-    def _wrapped_grid_next(idx, size, periodic):
-        nxt = idx + 1
-        if periodic:
-            return (idx + 1) % size
-        if nxt >= size:
-            return None
-        return nxt
-    def _make_density_image(self, face_tensors, rho_global, res=256):
-
-
-        uv_all = []
-        rho_all = []
-
-        for ft in face_tensors:
-            uv_i = ft["uv"].detach().cpu().numpy()                          # (Ni, 2)
-            gidx_i = ft["global_vertex_idx"]                                # (Ni,)
-            rho_i = rho_global[gidx_i].detach().cpu().numpy()               # (Ni,)
-
-            uv_all.append(uv_i)
-            rho_all.append(rho_i)
-
-        uv_all = np.concatenate(uv_all, axis=0)
-        rho_all = np.concatenate(rho_all, axis=0)
-
-        gx, gy = np.meshgrid(
-            np.linspace(0.0, 1.0, res),
-            np.linspace(0.0, 1.0, res),
-        )
-
-        density_img = griddata(
-            uv_all,
-            rho_all,
-            (gx, gy),
-            method="linear",
-            fill_value=0.0,
-        )
-
-        density_img = np.nan_to_num(density_img, nan=0.0, posinf=1.0, neginf=0.0)
-        density_img = np.clip(density_img, 0.0, 1.0)
-        return density_img
     def build_timelapse_render_cache(
         self,
         face_tensors,
@@ -2991,7 +3138,6 @@ class NN_Trainer:
 
         for ft in face_tensors:
             device = ft["uv"].device
-            uv_face = ft["uv"]
             uv_dense = ft["uv"]
             xyz_dense = ft["points_xyz"]
             Xu_dense = ft["Xu"]
@@ -3003,9 +3149,10 @@ class NN_Trainer:
 
             boundary_uv_i = None
             boundary_face_id_i = None
-            true_bidx_i = self._true_open_boundary_idx(ft)
+            boundary_loop_id_i = None
+            true_bidx_i, boundary_loop_id_i = self._ordered_true_open_boundary(ft)
             if true_bidx_i.numel() > 0:
-                boundary_uv_i = uv_face[true_bidx_i]
+                boundary_uv_i = ft["uv"][true_bidx_i]
                 boundary_face_id_i = torch.zeros(
                     boundary_uv_i.shape[0], dtype=torch.long, device=device
                 )
@@ -3014,11 +3161,15 @@ class NN_Trainer:
                 "face_id": ft["face_id"],
                 "uv_dense": uv_dense,
                 "xyz_dense": xyz_dense,
+                "points_xyz": xyz_dense,
                 "Xu_dense": Xu_dense,
                 "Xv_dense": Xv_dense,
+                "Xu": Xu_dense,
+                "Xv": Xv_dense,
                 "local_face_id": local_face_id,
                 "boundary_uv": boundary_uv_i,
                 "boundary_face_id": boundary_face_id_i,
+                "boundary_loop_id": boundary_loop_id_i,
                 "seed_domain_mask": self._seed_domain_mask_for_face(ft),
                 "faces_ijk": ft["faces_ijk"],
             })
@@ -3049,9 +3200,18 @@ class NN_Trainer:
             seed_domain_temp=self.cfg.seed_domain_temp,
         )
 
+        decoder_out = apply_density_postprocess_to_output(
+            decoder_out,
+            render_cache,
+            self.cfg,
+            return_debug=False,
+        )
+
         return {
             "xyz_dense": render_cache["xyz_dense"],
             "rho_dense": decoder_out["rho"],
+            "rho_raw_decoder_dense": decoder_out["rho_raw_decoder"],
+            "rho_postprocessed_dense": decoder_out["rho_postprocessed"],
             "fiber3d_dense": decoder_out["fiber3d"],
             "faces_ijk": render_cache["faces_ijk"],
         }
@@ -3248,20 +3408,6 @@ class NN_Trainer:
         if row.shape[1] > target_w:
             row = NN_Trainer._resize_to_width(row, target_w)
         return NN_Trainer._pad_to_size(row, target_w=target_w, bg_color=bg_color)
-
-    @staticmethod
-    def _stack_col_with_gaps(images, gap=22, bg_color=(255, 255, 255)):
-        target_w = max(img.shape[1] for img in images)
-        resized = [NN_Trainer._resize_to_width(img, target_w) for img in images]
-        if len(resized) == 1:
-            return resized[0]
-        gap_tile = np.full((gap, target_w, 3), bg_color, dtype=np.uint8)
-        parts = []
-        for i, img in enumerate(resized):
-            parts.append(img)
-            if i != len(resized) - 1:
-                parts.append(gap_tile)
-        return np.vstack(parts)
 
     def _render_current_cad_frame_cached(
         self,
@@ -3888,9 +4034,10 @@ class NN_Trainer:
 
         boundary_uv_i = None
         boundary_face_id_i = None
+        boundary_loop_id_i = None
 
         if use_boundary_attachment:
-            true_bidx_i = self._true_open_boundary_idx(ft)
+            true_bidx_i, boundary_loop_id_i = self._ordered_true_open_boundary(ft)
             if true_bidx_i.numel() > 0:
                 boundary_uv_i = uv_face[true_bidx_i]
                 boundary_face_id_i = torch.zeros(
@@ -3944,6 +4091,45 @@ class NN_Trainer:
             ["rho", "rho_v", "rho_b", "fiber3d", "edge_field"],
         )
 
+        full_indices = -torch.ones(
+            mask_dense_valid.shape[0],
+            dtype=torch.long,
+            device=device,
+        )
+        full_indices[mask_dense_valid] = torch.arange(
+            int(mask_dense_valid.sum().item()),
+            dtype=torch.long,
+            device=device,
+        )
+        faces_dense = []
+        for i in range(grid_res_u - 1):
+            for j in range(grid_res_v - 1):
+                k00 = i * grid_res_v + j
+                k01 = i * grid_res_v + j + 1
+                k10 = (i + 1) * grid_res_v + j
+                k11 = (i + 1) * grid_res_v + j + 1
+                ids = full_indices[torch.tensor([k00, k01, k10, k11], device=device)]
+                if bool((ids >= 0).all().item()):
+                    faces_dense.append(ids[[0, 1, 2]])
+                    faces_dense.append(ids[[2, 1, 3]])
+        if faces_dense:
+            faces_dense = torch.stack(faces_dense, dim=0)
+        else:
+            faces_dense = torch.empty((0, 3), dtype=torch.long, device=device)
+
+        dense_face_tensor = {
+            "points_xyz": xyz_dense,
+            "faces_ijk": faces_dense,
+            "Xu": Xu_dense,
+            "Xv": Xv_dense,
+        }
+        decoder_out = apply_density_postprocess_to_output(
+            decoder_out,
+            dense_face_tensor,
+            self.cfg,
+            return_debug=False,
+        )
+
         return {
             "face_id": ft["face_id"],
             "uv_dense": uv_dense,
@@ -3952,6 +4138,8 @@ class NN_Trainer:
             "Xu_dense": Xu_dense,
             "Xv_dense": Xv_dense,
             "rho_dense": decoder_out["rho"],
+            "rho_raw_decoder_dense": decoder_out["rho_raw_decoder"],
+            "rho_postprocessed_dense": decoder_out["rho_postprocessed"],
             "rho_v_dense": decoder_out["rho_v"],
             "rho_b_dense": decoder_out["rho_b"],
             "fiber3d_dense": decoder_out["fiber3d"],
@@ -4547,63 +4735,6 @@ class NN_Trainer:
         tuv = np.where(ok, tuv / np.clip(nrm, eps, None), 0.0)
         return tuv.astype(np.float32)
 
-    def _trace_streamline_on_dense_face(
-        self,
-        uv_np,
-        xyz_np,
-        t_uv_np,
-        rho_np,
-        start_idx,
-        step_uv,
-        max_steps,
-        kdtree,
-        align_thresh=0.2,
-        min_rho=0.0,
-        sign=1.0,
-    ):
-        path_xyz = [xyz_np[int(start_idx)]]
-        path_uv = [uv_np[int(start_idx)]]
-        current_uv = uv_np[int(start_idx)].copy()
-        prev_dir = None
-
-        for _ in range(int(max_steps)):
-            _dist, idx = kdtree.query(current_uv, k=1)
-            idx = int(idx)
-            if rho_np[idx] < float(min_rho):
-                break
-
-            direction = t_uv_np[idx].astype(np.float64) * float(sign)
-            nrm = np.linalg.norm(direction)
-            if not np.isfinite(nrm) or nrm <= 1e-12:
-                break
-            direction = direction / nrm
-
-            if prev_dir is not None and float(np.dot(direction, prev_dir)) < 0.0:
-                direction = -direction
-
-            next_uv = current_uv + float(step_uv) * direction
-            dist_next, next_idx = kdtree.query(next_uv, k=1)
-            next_idx = int(next_idx)
-            if not np.isfinite(dist_next):
-                break
-            if next_idx == idx:
-                break
-
-            chord = uv_np[next_idx] - current_uv
-            chord_nrm = np.linalg.norm(chord)
-            if chord_nrm <= 1e-12:
-                break
-            align = float(np.dot(direction, chord / chord_nrm))
-            if align < float(align_thresh):
-                break
-
-            current_uv = uv_np[next_idx].copy()
-            prev_dir = direction
-            path_uv.append(current_uv)
-            path_xyz.append(xyz_np[next_idx])
-
-        return np.asarray(path_uv, dtype=np.float32), np.asarray(path_xyz, dtype=np.float32)
-
     def visualize_result_final_smooth_surface_pyvista(
         self,
         result,
@@ -4958,6 +5089,11 @@ class NN_Trainer:
             dynamic_ncols=True,
         ) as pbar:
             for step in pbar:
+                should_log = (
+                    step == 0
+                    or step % cfg.log_every == 0
+                    or step == cfg.num_steps - 1
+                )
     
                 # if cfg.allow_seed_outside_domain is true and the warmup period is over, allow seeds to be placed outside the domain
                 allow_seed_outside_domain_step = self.allow_seed_outside_domain_for_step(step)
@@ -5001,6 +5137,9 @@ class NN_Trainer:
 
                 theta_mean_terms = []
                 a_metric_terms = []
+                d_uv_mean_terms = []
+                d_metric_mean_terms = []
+                d_metric_scale_terms = []
 
                 width_active_terms = []
                 face_weights_this_step = []
@@ -5036,6 +5175,7 @@ class NN_Trainer:
                 #seed_offset_scale_step=cfg.Offset_scale
                 uv_anchor_next = None
 
+                face_idx = 0
                 ft = face_tensor
                 uv_anchor_i = uv_anchor
                 face_weight_i = face_weight
@@ -5047,7 +5187,7 @@ class NN_Trainer:
                     if cfg.project_seed_spacing_each_step:
                         seeds_raw_i = self.project_seed_spacing(
                             seeds_list=[seeds_raw_i],
-                            min_dist=float(cfg.collapse_min_seed_dist_factor) * float(cfg.w_min),
+                            min_dist=float(cfg.collapse_min_seed_dist_factor) * float(0.01),
                             iters=int(cfg.seed_projection_iters),
                             detach=False,
                             clamp_to_domain=not allow_seed_outside_domain_step,
@@ -5078,7 +5218,8 @@ class NN_Trainer:
 
                     boundary_uv_i = None
                     boundary_face_id_i = None
-                    true_bidx_i = self._true_open_boundary_idx(ft)
+                    boundary_loop_id_i = None
+                    true_bidx_i, boundary_loop_id_i = self._ordered_true_open_boundary(ft)
                     if true_bidx_i.numel() > 0:
                         boundary_uv_i = ft["uv"][true_bidx_i]
                         boundary_face_id_i = torch.zeros(
@@ -5087,6 +5228,7 @@ class NN_Trainer:
                             device=device,
                         )
                     seed_domain_mask_i = self._seed_domain_mask_for_face(ft)
+
 
                     decoder_out = decoder(
                         points_uv=ft["uv"],
@@ -5126,6 +5268,13 @@ class NN_Trainer:
                             "seed_active_weights",
                             "seed_active_mask",
                         ],
+                    )
+
+                    decoder_out, density_post_stats_i = apply_density_postprocess_to_output(
+                        decoder_out,
+                        ft,
+                        cfg,
+                        return_debug=True,
                     )
 
                     seeds_i = decoder_out["seeds"]
@@ -5170,6 +5319,9 @@ class NN_Trainer:
                     boundary_width_i = decoder_out["boundary_width"]
                     boundary_alpha_i = decoder_out["boundary_alpha"]
                     boundary_beta_i = decoder_out["boundary_beta"]
+                    d_uv_mean_terms.append(decoder_out["d_uv_mean"])
+                    d_metric_mean_terms.append(decoder_out["d_metric_mean"])
+                    d_metric_scale_terms.append(decoder_out["d_metric_scale_mean"])
 
                     h_i = decoder_out["h"]
 
@@ -5267,7 +5419,7 @@ class NN_Trainer:
                                 seeds=seeds_i,
                                 seed_active_weights=None,
                                 sigma=cfg.seed_repulsion_sigma,
-                                min_dist=2.0 * float(cfg.w_min),
+                                min_dist=float(cfg.collapse_min_seed_dist_factor) * float(cfg.w_min),
                                 eps=cfg.eps,
                             )
                         )
@@ -5340,8 +5492,24 @@ class NN_Trainer:
                 rho = rho_acc / rho_wgt.clamp_min(cfg.eps)
                 rho_boundary = rho_b_acc / rho_b_wgt.clamp_min(cfg.eps)
                 rho_v_all = rho_v_acc / rho_v_wgt.clamp_min(cfg.eps)
-                rho_v_eff_all = self._soft_project_density(rho_v_all)
                 rho_s_all = rho_s_acc / rho_s_wgt.clamp_min(cfg.eps)
+                rho_raw = decoder_out["rho_raw_decoder"]
+
+                if should_log:
+                    src, dst = build_mesh_edges(ft["faces_ijk"])
+
+                    boundary_edges = (
+                        ((rho[src] - 0.5) * (rho[dst] - 0.5)) < 0
+                    )
+
+                    edge_jump = (rho[src] - rho[dst]).abs()
+
+                    boundary_jump_mean = (
+                        edge_jump[boundary_edges].mean().item()
+                        if boundary_edges.any()
+                        else 0.0
+                    )
+
 
                 fiber_surface = fiber_acc / fiber_wgt.clamp_min(cfg.eps)[:, None]
                 fiber_norm = fiber_surface.norm(dim=1, keepdim=True).clamp_min(cfg.eps)
@@ -5365,6 +5533,9 @@ class NN_Trainer:
 
                 theta_mean = theta_mean_terms[0] if theta_mean_terms else zero
                 a_metric_mean = a_metric_terms[0] if a_metric_terms else zero
+                d_uv_mean = d_uv_mean_terms[0] if d_uv_mean_terms else zero
+                d_metric_mean = d_metric_mean_terms[0] if d_metric_mean_terms else zero
+                d_metric_scale_mean = d_metric_scale_terms[0] if d_metric_scale_terms else zero
 
                 loss_width_active = width_active_terms[0] if compute_width_active_loss and width_active_terms else zero
 
@@ -5380,7 +5551,7 @@ class NN_Trainer:
                     eps=cfg.eps,
                 )
                 vol_frac_eff = self.loss_volume.powered_fraction(
-                    rho=rho_v_eff_all,
+                    rho=rho_v_all,
                     A_v=A_v,
                     power=cfg.effective_volume_power,
                     eps=cfg.eps,
@@ -5404,7 +5575,7 @@ class NN_Trainer:
                     )
 
                     loss_vol_eff_v, vol_frac_eff = self.loss_volume.powered(
-                        rho=rho_v_eff_all,
+                        rho=rho_v_all,
                         A_v=A_v,
                         target_volfrac=cfg.target_volfrac,
                         power=cfg.effective_volume_power,
@@ -5765,6 +5936,14 @@ class NN_Trainer:
                         "rho_min": rho_min,
                         "rho_mean": rho_mean,
                         "rho_max": rho_max,
+                        "filter_delta_mean": density_post_stats_i["filter_delta_mean"],
+                        "filter_delta_max": density_post_stats_i["filter_delta_max"],
+                        "projection_delta_mean": density_post_stats_i["projection_delta_mean"],
+                        "projection_delta_max": density_post_stats_i["projection_delta_max"],
+                        "rho_raw_mean": density_post_stats_i["raw_mean"],
+                        "rho_filtered_mean": density_post_stats_i["filtered_mean"],
+                        "rho_projected_mean": density_post_stats_i["projected_mean"],
+                        "rho_final_mean": density_post_stats_i["final_mean"],
                         "rho_boundary_min": rho_boundary_min,
                         "rho_boundary_mean": rho_boundary_mean,
                         "rho_boundary_max": rho_boundary_max,
@@ -5794,6 +5973,9 @@ class NN_Trainer:
 
                         "theta_mean": self._finite_or_default(theta_mean),
                         "a_metric_mean": self._finite_or_default(a_metric_mean),
+                        "d_uv_mean": self._finite_or_default(d_uv_mean),
+                        "d_metric_mean": self._finite_or_default(d_metric_mean),
+                        "d_metric_scale_mean": self._finite_or_default(d_metric_scale_mean),
 
                         "active_count_total": participating_count_total,
                         "active_count_mean": participating_count_mean,
@@ -5890,6 +6072,7 @@ class NN_Trainer:
                         tqdm.write(
                             f"[{step:05d}] | "
                             f"Active Seeds/Total={participating_count_total:.0f}/{participating_count_total+inactive_count_total:.0f} | "
+
                             f"L_total={row['L_total']:.4e} | "
                             f"L_vol={row['loss_vol']:.3e} "
                             f"L_fem={row['loss_fem']:.3e} "
@@ -5922,6 +6105,13 @@ class NN_Trainer:
                             f"seed_active_w(min/mean/max)={active_weight_min_global:.3f}/{active_weight_mean_global:.3f}/{active_weight_max_global:.3f} | "
                             f"Δrho={drho:.2e} Δseed={dseed:.2e} "
                             f"dmin={min_seed_dist:.2e} grad_mean={g_mean:.2e} | "
+                                                        f"Filter Δrho mean={row['filter_delta_mean']:.2e} "
+                            f"Filter Δrho max={row['filter_delta_max']:.2e} "
+                            f"Projection Δrho mean={row['projection_delta_mean']:.2e} "
+                            f"Projection Δrho max={row['projection_delta_max']:.2e} | "
+                            f"rho_raw_mean={row['rho_raw_mean']:.3f} "
+                            f"rho_filtered_mean={row['rho_filtered_mean']:.3f} "
+                            f"rho_final_mean={row['rho_final_mean']:.3f} | "
                             f"fem={fem_status} | "
                             f"best={best_score:.4e}@{best_step} | "
                             f"best_hard={best_hard_score:.4e}@{best_hard_step}"
@@ -6089,7 +6279,8 @@ class NN_Trainer:
                 local_face_id = torch.zeros(face_tensor["uv"].shape[0], dtype=torch.long, device=device)
                 boundary_uv_i = None
                 boundary_face_id_i = None
-                true_bidx_i = self._true_open_boundary_idx(face_tensor)
+                boundary_loop_id_i = None
+                true_bidx_i, boundary_loop_id_i = self._ordered_true_open_boundary(face_tensor)
                 if true_bidx_i.numel() > 0:
                     boundary_uv_i = face_tensor["uv"][true_bidx_i]
                     boundary_face_id_i = torch.zeros(
@@ -6124,6 +6315,13 @@ class NN_Trainer:
                     )
                 finally:
                     self._restore_decoder_seed_state(decoder, decoder_seed_state)
+
+                hard_out_i = apply_density_postprocess_to_output(
+                    hard_out_i,
+                    face_tensor,
+                    cfg,
+                    return_debug=False,
+                )
 
                 w_local = A_local.clamp_min(cfg.eps)
                 hard_rho_acc[gidx] += hard_out_i["rho"] * w_local

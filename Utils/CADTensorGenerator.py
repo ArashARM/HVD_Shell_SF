@@ -52,6 +52,7 @@ class CADTensorGenerator:
         seed_domain_mask_res: int = 128,
         seed_domain_trim_tol: float = 1e-7,
         selected_face_index: int = 0,
+        random_seed: int | None = None,
     ):
         self.deflection = float(deflection)
         self.angle = float(angle)
@@ -66,6 +67,8 @@ class CADTensorGenerator:
         self.seed_domain_mask_res = int(seed_domain_mask_res)
         self.seed_domain_trim_tol = float(seed_domain_trim_tol)
         self.selected_face_index = int(selected_face_index)
+        self.random_seed = None if random_seed is None else int(random_seed)
+        self.rng = np.random.default_rng(self.random_seed)
         if self.selected_face_index < 0:
             raise ValueError(
                 f"selected_face_index must be >= 0, got {self.selected_face_index}"
@@ -354,6 +357,25 @@ class CADTensorGenerator:
             finally:
                 gmsh.finalize()
 
+    @staticmethod
+    def minimum_triangle_edge_length(vertices, faces):
+        vertices = np.asarray(vertices, dtype=float)
+        faces = np.asarray(faces, dtype=np.int64)
+        if vertices.size == 0 or faces.size == 0:
+            return None
+
+        edge_pairs = ((0, 1), (1, 2), (2, 0))
+        min_edge = np.inf
+        for i, j in edge_pairs:
+            edges = vertices[faces[:, i]] - vertices[faces[:, j]]
+            lengths = np.linalg.norm(edges, axis=1)
+            if lengths.size:
+                min_edge = min(min_edge, float(np.min(lengths)))
+
+        if not np.isfinite(min_edge):
+            return None
+        return float(min_edge)
+
     # =========================================================================
     # 4) UV normalization + metric
     # =========================================================================
@@ -533,6 +555,8 @@ class CADTensorGenerator:
             )
             if tri is not None:
                 print("Model is meshed using Gmsh tool")
+                min_element_size = cls.minimum_triangle_edge_length(tri[0], tri[2])
+
                 return tri
             if mesher == "gmsh":
                 raise RuntimeError("Gmsh meshing failed for free-form face.")
@@ -750,6 +774,7 @@ class CADTensorGenerator:
                     use_fps=use_fps,
                     fps_pool_factor=fps_pool_factor,
                     device=self.device,
+                    rng=self.rng,
                 )
             except Exception as e:
                 print(f"[warn] face {face_id}: point sampling failed: {e}")
@@ -1151,6 +1176,28 @@ class CADTensorGenerator:
         }
 
     @staticmethod
+    def uv_nearest_point_distance(uv: torch.Tensor, chunk_size: int = 2048) -> float:
+        if uv.numel() == 0 or uv.shape[0] < 2:
+            return 0.0
+
+        uv_cpu = uv.detach().to(device="cpu", dtype=torch.float32)
+        n = int(uv_cpu.shape[0])
+        min_dist = float("inf")
+
+        for start in range(0, n, int(chunk_size)):
+            stop = min(start + int(chunk_size), n)
+            dist = torch.cdist(uv_cpu[start:stop], uv_cpu)
+            rows = stop - start
+            dist[torch.arange(rows), torch.arange(start, stop)] = float("inf")
+            local_min = dist.min()
+            if torch.isfinite(local_min):
+                min_dist = min(min_dist, float(local_min.item()))
+
+        if not np.isfinite(min_dist):
+            return 0.0
+        return float(min_dist)
+
+    @staticmethod
     def uv_support_radius(
         uv: torch.Tensor,
         u_periodic: bool = False,
@@ -1459,6 +1506,7 @@ class CADTensorGenerator:
         )
 
         num_verts = uv.shape[0]
+        uv_min_point_distance = self.uv_nearest_point_distance(uv)
         pv_faces = self.faces_df_to_pv_faces_autodetect(faces_df)
 
         if faces_ijk.numel():
@@ -1560,6 +1608,7 @@ class CADTensorGenerator:
             "mesh_edge_mean": mesh_edge_stats["mean"],
             "mesh_edge_median": mesh_edge_stats["median"],
             "mesh_edge_num_edges": mesh_edge_stats["num_edges"],
+            "uv_min_point_distance": uv_min_point_distance,
             "BBX": BBX,
             "face_tensors": face_tensors,
             "face_tensors_by_id": face_tensors_by_id,
@@ -1695,6 +1744,7 @@ class CADTensorGenerator:
         points_xyz: torch.Tensor,
         S: int,
         exclude_idx: torch.Tensor | None = None,
+        seed: int | None = None,
         start_idx: int | None = None,
     ) -> torch.Tensor:
         """
@@ -1708,6 +1758,9 @@ class CADTensorGenerator:
         returns:
             idx_global: (S,) long tensor of sampled vertex indices
         """
+        if seed is not None:
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
         device = points_xyz.device
         N = points_xyz.shape[0]
 
